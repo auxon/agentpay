@@ -38,6 +38,9 @@ X402_MIN_TREASURY_SATS = "5000"
 # Bounty payouts: sats per USD cent when crediting a settled bounty.
 # Default 40000 = $25/BSV, matching bsv-bounties' BSV_USD var.
 # BOUNTY_SATS_PER_CENT = "40000"
+# Two-way trust (work -> spend): off | log | enforce. Default log for 3-day
+# observation per CEO #3; flip to enforce after review. Never raises limits.
+TRUST_GATE_PAY = "log"
 # Secrets (wrangler secret put):
 #   STRIPE_SECRET_KEY       restricted rk_live_… / rk_test_… — needs Checkout
 #                           Sessions (write), Customers (write), Subscriptions

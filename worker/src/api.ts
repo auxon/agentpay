@@ -102,6 +102,7 @@ import {
   type Attestation,
 } from "./attestations";
 import { callServiceTool, getService, listServices, quoteService, registryAvailable } from "./registry";
+import { applyTrustMultiplier, decidePayTrust, fetchReputation, trustPayMode } from "./trust";
 import {
   bountyPayoutInfo,
   bountyRecord,
@@ -331,6 +332,7 @@ async function gateSpend(
     toolName?: string;
     serviceLabel?: string;
     toolLabel?: string;
+    thresholdOverride?: number | null;
   },
 ): Promise<GateResult> {
   const policy = await getAgentPolicy(c.env.DB, input.agent.id);
@@ -343,7 +345,7 @@ async function gateSpend(
     throw new HttpError(403, "This agent's allowlist does not permit generic spend");
   }
 
-  const threshold = policy.approval_above_cents;
+  const threshold = input.thresholdOverride !== undefined ? input.thresholdOverride : policy.approval_above_cents;
   if (threshold === null || input.amountCents < threshold) return null;
 
   if (!input.approvalId) {
@@ -1145,6 +1147,7 @@ api.post("/agent/pay-service", async (c) => {
     description?: unknown;
     ref?: unknown;
     approvalId?: unknown;
+    bountyAccount?: unknown;
   };
   const serviceId = cleanStr(body.serviceId, 80);
   const toolName = cleanStr(body.tool, 80);
@@ -1171,7 +1174,30 @@ api.post("/agent/pay-service", async (c) => {
   const requirements = parseBsvRequirements(quote.requirements);
   const amountCents = chargeCentsFor(requirements.satoshis, c.env, body.amountCents);
 
-  // 1b. Scope + approval gate (no funds move until this passes).
+  // 1b. Two-way trust (work -> spend): reputation fast-paths approval x2.
+  // Read-only, fail closed. Mode defaults to log-only for 3 days.
+  const trustMode = trustPayMode(c.env);
+  const bountyAccount =
+    typeof body.bountyAccount === "number" && Number.isFinite(body.bountyAccount) ? Math.floor(body.bountyAccount) : null;
+  const reputation = trustMode === "off" ? null : await fetchReputation(c.env, bountyAccount);
+  const trustDecision = decidePayTrust(reputation);
+  const trustApplied = trustMode === "enforce" && trustDecision.fastPath;
+  const basePolicy = await getAgentPolicy(c.env.DB, agent.id);
+  const effectiveThreshold = trustApplied
+    ? applyTrustMultiplier(basePolicy.approval_above_cents, trustDecision)
+    : basePolicy.approval_above_cents;
+  const trust = {
+    mode: trustMode,
+    fastPath: trustDecision.fastPath,
+    applied: trustApplied,
+    reason: trustDecision.reason,
+    reputation: trustDecision.reputation,
+    baseThreshold: basePolicy.approval_above_cents,
+    effectiveThreshold,
+    discountEligible: trustDecision.fastPath,
+  };
+
+  // 1c. Scope + approval gate (no funds move until this passes).
   const approvalId = cleanStr(body.approvalId, 80);
   const gate = await gateSpend(c, {
     wallet,
@@ -1184,8 +1210,16 @@ api.post("/agent/pay-service", async (c) => {
     toolName,
     serviceLabel: service.name,
     toolLabel: tool.name,
+    thresholdOverride: effectiveThreshold,
   });
-  if (gate && "response" in gate) return gate.response;
+  if (gate && "response" in gate) {
+    // Enrich approval_required with trust context (still 402).
+    const payload = (await gate.response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (payload && typeof payload === "object") {
+      return c.json({ ...payload, trust }, 402);
+    }
+    return gate.response;
+  }
 
   // 2. BSV rail: sign first (503 before any charge if unfunded), debit, then settle.
   if (siteWalletConfigured(c.env)) {
@@ -1282,6 +1316,7 @@ api.post("/agent/pay-service", async (c) => {
       chargedCents: amountCents,
       paymentResponse: paymentResponse ? safeParseB64(paymentResponse) : null,
       seller,
+      trust,
     });
   }
 
@@ -1314,6 +1349,7 @@ api.post("/agent/pay-service", async (c) => {
     quote,
     settlement: "wallet",
     note: "Site wallet WIF is not configured, so no on-chain payment was made. Configure SITE_WALLET_WIF to settle x402 challenges.",
+    trust,
   });
 });
 

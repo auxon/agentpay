@@ -208,19 +208,28 @@ export function createAgentPayMcpServer(
     {
       title: "Quote a service",
       description:
-        "Call a registry tool unsigned and return the live 402 payment requirements (price/payTo). Public — no key needed.",
+        "Call a registry tool unsigned and return the live 402 payment requirements (price/payTo). Public — no key needed. Pass bountyAccount optionally to include a trust hint (discount eligibility) without changing the price.",
       inputSchema: z.object({
         serviceId: z.string().describe("Registry service id (from list_services)"),
         tool: z.string().describe("Tool name on that service"),
+        bountyAccount: z.number().int().positive().optional().describe("BSVBounties account # for trust hint"),
       }),
     },
-    async ({ serviceId, tool }) => {
+    async ({ serviceId, tool, bountyAccount }) => {
       const { status, json } = await call(
         "GET",
         `/services/${encodeURIComponent(serviceId)}/quote?tool=${encodeURIComponent(tool)}`,
       );
       if (status >= 400) return fail(status, json);
-      return ok(json);
+      // Trust hint is advisory only; quote price is unchanged (public semantics preserved).
+      const out = json as Record<string, unknown>;
+      if (typeof bountyAccount === "number") {
+        out.trust_hint = {
+          bountyAccount,
+          note: "Pass bountyAccount to pay_service for reputation fast-path (approval x2) and seller discount eligibility.",
+        };
+      }
+      return ok(out);
     },
   );
 
@@ -255,7 +264,7 @@ export function createAgentPayMcpServer(
     {
       title: "Pay a service",
       description:
-        "One call for paid registry tools: quotes the seller's x402 challenge, pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded.",
+        "One call for paid registry tools: quotes the seller's x402 challenge, pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded. Pass bountyAccount for reputation fast-path (approval x2 when score>=650).",
       inputSchema: z.object({
         serviceId: z.string().describe("Registry service id (from list_services)"),
         tool: z.string().describe("Tool name on that service"),
@@ -264,13 +273,14 @@ export function createAgentPayMcpServer(
         description: z.string().max(200).optional(),
         ref: z.string().optional(),
         approvalId: z.string().optional().describe("Approval id from a prior approval_required response"),
+        bountyAccount: z.number().int().positive().optional().describe("BSVBounties account # for trust fast-path"),
         key: keyField,
       }),
     },
-    async ({ serviceId, tool, params, amountCents, description, ref, approvalId, key }) => {
+    async ({ serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount, key }) => {
       const { status, json } = await call("POST", "/agent/pay-service", {
         key,
-        body: { serviceId, tool, params, amountCents, description, ref, approvalId },
+        body: { serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount },
       });
       if (status >= 400) return fail(status, json);
       return ok(json);
