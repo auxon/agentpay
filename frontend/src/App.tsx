@@ -283,6 +283,12 @@ export default function App() {
         <span>
           agentpay · <a href="https://github.com/auxon">github.com/auxon</a> · card payments on Cloudflare
         </span>
+        <span>
+          Part of <a href="https://entangleit.com/">EntangleIT</a>:{" "}
+          <a href="https://entangleit.com/x402gateway/">x402 Gateway</a> ·{" "}
+          <a href="https://entangleit.com/x402market/">x402market</a> ·{" "}
+          <a href="https://entangleit.com/bsvbounties/">BSVBounties</a>
+        </span>
       </footer>
     </div>
   );

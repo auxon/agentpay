@@ -341,7 +341,8 @@ re-credits the poster. Blocked payouts (missing address, index lag) land in
 **Selling to agents.** The companion **x402 Seller Kit** turns any API into a
 paid x402 endpoint in minutes and lists it in
 [x402market](https://entangleit.com/x402market/); agents pay it with
-`pay_service`.
+`pay_service`. For a zero-ops hosted endpoint (auth injection, replay guard,
+analytics), use the [x402 Gateway](https://entangleit.com/x402gateway/).
 
 ## Roadmap
 
