@@ -19,6 +19,7 @@ export const MCP_VERSION = "0.1.0";
 
 export const MCP_TOOLS = [
   "health",
+  "onboard",
   "get_balance",
   "create_topup_link",
   "create_upgrade_link",
@@ -46,6 +47,7 @@ export const MCP_INSTRUCTIONS = [
   "agentpay is a prepaid USD wallet for AI agents on Cloudflare.",
   "Human dashboard: https://entangleit.com/agentpay/ (create a wallet, top up with a card via Stripe, mint agent keys).",
   "Agents authenticate with a scoped key (agp_…). Pass it as the Authorization: Bearer header on this MCP connection, or as the `key` parameter on a tool call.",
+  "New agents call onboard first: it inspects balance, claims, and history, then returns the single next action.",
   "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges.",
   "Wallet tools: get_balance, list_transactions, get_receipt.",
   "Spending: spend debits the wallet and writes a receipt. pay_service quotes the seller, settles the BSV x402 challenge from the site wallet, and returns the seller's result — all in one call.",
@@ -566,6 +568,52 @@ export function createAgentPayMcpServer(
       const { status, json } = await call("GET", "/agent/bounties", { key });
       if (status >= 400) return fail(status, json);
       return ok(json);
+    },
+  );
+
+  server.registerTool(
+    "onboard",
+    {
+      title: "Onboard this agent",
+      description:
+        "First call for a new agent: inspects balance, claims, earnings, and spend history, then returns the single next action (earn first, dry-run spend, link identity, or scale). Free.",
+      inputSchema: z.object({ key: keyField }),
+    },
+    async ({ key }) => {
+      const [me, mine, att] = await Promise.all([
+        call("GET", "/agent/me", { key }),
+        call("GET", "/agent/bounties", { key }),
+        call("POST", "/agent/attestation", { key, body: { days: 30 } }),
+      ]);
+      if (me.status >= 400) return fail(me.status, me.json);
+      const { nextStep } = await import("./onboard");
+      const wallet = (me.json as Record<string, Record<string, number>>).wallet ?? {};
+      const links = Array.isArray((mine.json as Record<string, unknown[]>).bounties)
+        ? ((mine.json as Record<string, Array<Record<string, unknown>>>).bounties ?? [])
+        : [];
+      const linkedAccounts = [
+        ...new Set(
+          links
+            .map((l) => Number(l.worker_account))
+            .filter((n) => Number.isFinite(n) && n > 0),
+        ),
+      ];
+      const paidClaims = links.filter((l) => l.status === "paid").length;
+      const next = nextStep({
+        balanceCents: Number(wallet.balance_cents ?? 0),
+        linkedAccounts,
+        claims: links.length,
+        paidClaims,
+        hasHistory: att.status < 400,
+      });
+      return ok({
+        balanceCents: Number(wallet.balance_cents ?? 0),
+        claims: links.length,
+        paidClaims,
+        linkedAccounts,
+        hasSpendHistory: att.status < 400,
+        next,
+      });
     },
   );
 

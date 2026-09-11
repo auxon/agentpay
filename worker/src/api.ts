@@ -529,6 +529,7 @@ api.get("/start", async (c) => {
     ],
     mcp: `${PUBLIC_SITE}${MCP_PATH}`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
+    connect: `${PUBLIC_SITE}${API_PREFIX}/connect`,
     base,
   });
 });
@@ -542,6 +543,7 @@ api.get("/agent-card", async (c) => {
     site: `${PUBLIC_SITE}/agentpay/`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
     mcp: { endpoint: `${PUBLIC_SITE}${MCP_PATH}`, transport: "streamable-http", auth: "Bearer agp_… (header or per-tool key)" },
+    connect: `${PUBLIC_SITE}${API_PREFIX}/connect`,
     tools: MCP_TOOLS,
     registry: `${PUBLIC_SITE}/x402market/`,
     trust: {
@@ -554,6 +556,35 @@ api.get("/agent-card", async (c) => {
       bondDiscount: "claim_bounty {attestation, attestationSignature} → 50% worker bond off when eligible",
       sandbox: "pay_service {dryRun:true} → quote + policy check, no charge",
     },
+    starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
+  });
+});
+
+/** Copy-paste client configs to connect an agent in under a minute. */
+api.get("/connect", async (c) => {
+  const key = cleanStr(c.req.query("key"), 120);
+  const auth = key || "agp_YOUR_KEY_HERE";
+  const mcpUrl = `${PUBLIC_SITE}${MCP_PATH}`;
+  return c.json({
+    mcp: { url: mcpUrl, transport: "streamable-http", authHeader: `Authorization: Bearer ${key ? "agp_…(embedded)" : auth}` },
+    claudeCode: {
+      note: "Run in a terminal, or add to ~/.claude.json mcpServers",
+      command: `claude mcp add --transport http agentpay ${mcpUrl} --header "Authorization: Bearer ${auth}"`,
+    },
+    cursor: {
+      note: "Settings → MCP → Add custom MCP, or paste into ~/.cursor/mcp.json",
+      json: { mcpServers: { agentpay: { url: mcpUrl, headers: { Authorization: `Bearer ${auth}` } } } },
+    },
+    opencode: {
+      note: "Paste into opencode.json mcp section",
+      json: { mcp: { agentpay: { type: "remote", url: mcpUrl, headers: { Authorization: `Bearer ${auth}` } } } },
+    },
+    smoke: {
+      note: "No key needed for discovery",
+      curl: `curl -s -X POST ${mcpUrl} -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 300`,
+    },
+    firstTool: "onboard",
+    docs: `${PUBLIC_SITE}/agentpay/docs/`,
     starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
   });
 });
