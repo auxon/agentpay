@@ -1,0 +1,53 @@
+name = "agentpay-api"
+main = "src/index.ts"
+compatibility_date = "2026-08-31"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+# Path routes only — a Custom Domain on the apex would steal entangleit.com.
+routes = [
+  { pattern = "entangleit.com/api/agentpay/*", zone_name = "entangleit.com" },
+]
+
+# Shared `entangleit` D1 (same database as brainstorm / x402market) — ap_ tables only.
+[[d1_databases]]
+binding = "DB"
+database_name = "entangleit"
+database_id = "8f6c1ac7-ab0c-4133-a037-6ac1ed6afa6e"
+
+# Earn side: bsv-bounties settle events credit linked wallets. The binding
+# bypasses same-zone route caveats; BOUNTIES_API_URL (workers.dev) is the
+# fallback for local dev.
+[[services]]
+binding = "BOUNTIES"
+service = "bsv-bounties"
+
+[vars]
+APP_ORIGIN = "https://entangleit.com"
+# Plans: every wallet starts Free; Pro is a monthly Stripe subscription.
+PRO_PRICE_CENTS = "2900"
+# Optional: a pre-created recurring Price for Pro (recommended once live, for
+# cleaner reporting). When unset, Checkout uses an ad-hoc monthly price.
+# STRIPE_PRICE_PRO = "price_..."
+# x402 rail
+X402_MAX_SATS = "10000"
+X402_MIN_TREASURY_SATS = "5000"
+# Optional: sats per USD cent for automatic pay_service pricing.
+# Unset = charge the 1-cent minimum per paid call.
+# X402_SATS_PER_CENT = "20000"
+# Bounty payouts: sats per USD cent when crediting a settled bounty.
+# Default 40000 = $25/BSV, matching bsv-bounties' BSV_USD var.
+# BOUNTY_SATS_PER_CENT = "40000"
+# Secrets (wrangler secret put):
+#   STRIPE_SECRET_KEY       restricted rk_live_… / rk_test_… — needs Checkout
+#                           Sessions (write), Customers (write), Subscriptions
+#                           (write) and Billing Portal (write) for the Pro plan.
+#   STRIPE_WEBHOOK_SECRET   signing secret of the /api/agentpay/webhooks/stripe
+#                           endpoint; enable checkout.session.completed,
+#                           customer.subscription.*, invoice.paid and
+#                           invoice.payment_failed events.
+#   STRIPE_PUBLISHABLE_KEY  optional pk_… (safe to keep as a var)
+#   SITE_WALLET_WIF         BSV treasury that pays x402 sellers (never log or commit)
+#   ADMIN_SECRET            ops endpoints (x-admin-secret)
+#   BOUNTIES_WEBHOOK_SECRET shared secret bsv-bounties sends on settle events
+#                           (x-agentpay-internal). Same value in both workers.

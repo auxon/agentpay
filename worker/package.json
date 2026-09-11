@@ -1,0 +1,30 @@
+{
+  "name": "agentpay-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8788",
+    "deploy": "wrangler deploy",
+    "db:apply": "wrangler d1 execute entangleit --file=schema.sql --remote",
+    "db:apply:local": "wrangler d1 execute entangleit --file=schema.sql --local",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "tsc --noEmit && vitest run"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.5.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "^0.22.0",
+    "hono": "^4.9.8",
+    "stripe": "^22.4.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260910.1",
+    "@types/node": "^24.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.34.0"
+  }
+}

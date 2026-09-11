@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.entangleit/agentpay",
+  "title": "agentpay — card-funded wallets for AI agents",
+  "description": "Prepaid USD wallets for AI agents: card top-ups, scoped keys, BSV x402 payments over MCP.",
+  "version": "0.1.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://entangleit.com/api/agentpay/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Agent key: Bearer agp_… (mint one at entangleit.com/agentpay). Optional — list_services and service_quote are public.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
