@@ -351,14 +351,15 @@ export function createAgentPayMcpServer(
     {
       title: "Get proof-of-spend attestation",
       description:
-        "Ask agentpay to sign a summary of this wallet's settled activity (payments, distinct services, spend, refunds, bounty earnings) for a window. Sellers verify it to grant trust or discounts. Free.",
+        "Ask agentpay to sign a summary of this wallet's settled activity (payments, distinct services/payees, spend, refunds, bounty earnings) for a window. Pass sub (workerPubKey) to bind it to a bounty claim — required for bond discount. Free.",
       inputSchema: z.object({
         days: z.number().int().min(1).max(365).optional().describe("Window in days (default 30)"),
+        sub: z.string().max(120).optional().describe("Claimant binding, e.g. workerPubKey for a bounty claim"),
         key: keyField,
       }),
     },
-    async ({ days, key }) => {
-      const { status, json } = await call("POST", "/agent/attestation", { key, body: { days } });
+    async ({ days, sub, key }) => {
+      const { status, json } = await call("POST", "/agent/attestation", { key, body: { days, sub } });
       if (status >= 400) return fail(status, json);
       return ok(json);
     },
@@ -443,14 +444,20 @@ export function createAgentPayMcpServer(
     {
       title: "Claim a bounty",
       description:
-        "Claim a bounty for this wallet. Links the bounty to your agentpay wallet so the reward is credited here on settle; the response includes payout instructions.",
+        "Claim a bounty for this wallet. Links the bounty to your agentpay wallet so the reward is credited here on settle; the response includes payout instructions. Pass workerAccount/workerPubKey (BSV identity) to bind trust.",
       inputSchema: z.object({
         bountyId: z.string().describe("Bounty id from list_bounties"),
+        workerAccount: z.number().int().positive().optional().describe("BSVBounties account # doing the work"),
+        workerPubKey: z.string().optional().describe("BSV worker identity key"),
+        payoutAddress: z.string().optional().describe("Optional BSV P2PKH payout address for direct sats"),
         key: keyField,
       }),
     },
-    async ({ bountyId, key }) => {
-      const { status, json } = await call("POST", `/bounties/${encodeURIComponent(bountyId)}/claim`, { key });
+    async ({ bountyId, workerAccount, workerPubKey, payoutAddress, key }) => {
+      const { status, json } = await call("POST", `/bounties/${encodeURIComponent(bountyId)}/claim`, {
+        key,
+        body: { workerAccount, workerPubKey, payoutAddress },
+      });
       if (status >= 400) return fail(status, json);
       return ok(json);
     },

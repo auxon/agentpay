@@ -54,6 +54,8 @@ export interface BountyLinkRow {
   wallet_id: string;
   agent_id: string | null;
   worker_ref: string;
+  worker_account: number | null;
+  worker_pubkey: string | null;
   title: string;
   amount_sats: number | null;
   status: "claimed" | "submitted" | "paid" | "refunded";
@@ -170,11 +172,15 @@ export async function claimBountyRemote(
   env: AppEnv,
   id: string,
   workerRef: string,
+  opts: { workerPubKey?: string; workerAccount?: number } = {},
 ): Promise<unknown> {
   return bountiesJson(env, `/bounties/${encodeURIComponent(id)}/claim`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ workerPubKey: workerRef }),
+    body: JSON.stringify({
+      workerPubKey: opts.workerPubKey ?? workerRef,
+      workerAccount: opts.workerAccount,
+    }),
   });
 }
 
@@ -197,20 +203,27 @@ export async function linkBounty(
     walletId: string;
     agentId: string | null;
     workerRef: string;
+    workerAccount?: number | null;
+    workerPubkey?: string | null;
     title?: string;
     amountSats?: number | null;
     payoutAddress?: string | null;
   },
 ): Promise<BountyLinkRow> {
   const now = nowIso();
+  // Runtime ensure for pre-migration DBs (schema.sql covers fresh installs).
+  await db.prepare("ALTER TABLE ap_bounty_links ADD COLUMN worker_account INTEGER").run().catch(() => {});
+  await db.prepare("ALTER TABLE ap_bounty_links ADD COLUMN worker_pubkey TEXT").run().catch(() => {});
   await db
     .prepare(
-      `INSERT INTO ap_bounty_links (bounty_id, wallet_id, agent_id, worker_ref, title, amount_sats, status, payout_address, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)
+      `INSERT INTO ap_bounty_links (bounty_id, wallet_id, agent_id, worker_ref, worker_account, worker_pubkey, title, amount_sats, status, payout_address, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)
        ON CONFLICT(bounty_id) DO UPDATE SET
          wallet_id = excluded.wallet_id,
          agent_id = excluded.agent_id,
          worker_ref = excluded.worker_ref,
+         worker_account = COALESCE(excluded.worker_account, ap_bounty_links.worker_account),
+         worker_pubkey = COALESCE(excluded.worker_pubkey, ap_bounty_links.worker_pubkey),
          title = excluded.title,
          amount_sats = COALESCE(excluded.amount_sats, ap_bounty_links.amount_sats),
          payout_address = COALESCE(excluded.payout_address, ap_bounty_links.payout_address),
@@ -222,6 +235,8 @@ export async function linkBounty(
       input.walletId,
       input.agentId,
       input.workerRef,
+      input.workerAccount ?? null,
+      input.workerPubkey ?? null,
       input.title ?? "",
       input.amountSats ?? null,
       input.payoutAddress ?? null,

@@ -20,6 +20,8 @@ export const ATTESTATION_DAYS_MAX = 365;
 export interface AttestationMetrics {
   settledPayments: number;
   distinctServices: number;
+  /** Distinct on-chain payees (anti-wash; 0 when unsettled off-chain). */
+  distinctPayTo: number;
   spentCents: number;
   refundedCents: number;
   /** Bounty payouts credited to this wallet in the window. */
@@ -34,6 +36,8 @@ export interface Attestation {
   v: number;
   iss: string;
   wallet: string;
+  /** Optional claimant binding (workerPubKey or account ref). Verified by bounties. */
+  sub?: string;
   windowDays: number;
   issuedAt: string;
   expiresAt: string;
@@ -170,6 +174,7 @@ export async function buildAttestation(
   db: D1Database,
   walletId: string,
   days: number,
+  opts: { sub?: string } = {},
 ): Promise<Attestation | null> {
   const since = sinceBounds(days);
   const window = await db
@@ -208,17 +213,29 @@ export async function buildAttestation(
     .bind(walletId)
     .first<{ at: string | null }>();
 
+  const payees = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT json_extract(meta_json, '$.payTo')) AS n FROM ap_ledger
+       WHERE wallet_id = ? AND kind = 'debit'
+         AND json_extract(meta_json, '$.payTo') IS NOT NULL
+         AND (created_at >= ? OR created_at >= ?)`,
+    )
+    .bind(walletId, since.iso, since.sql)
+    .first<{ n: number }>();
+
   const issuedAt = nowIso();
   return {
     v: ATTESTATION_VERSION,
     iss: ATTESTATION_ISSUER,
     wallet: walletId,
+    ...(opts.sub ? { sub: opts.sub } : {}),
     windowDays: days,
     issuedAt,
     expiresAt: new Date(Date.now() + 7 * 86_400_000).toISOString(),
     metrics: {
       settledPayments,
       distinctServices: Number(window?.services ?? 0),
+      distinctPayTo: Number(payees?.n ?? 0),
       spentCents: Math.abs(Number(window?.cents ?? 0)),
       refundedCents: Math.abs(Number(refunds?.cents ?? 0)),
       bountyPayouts,

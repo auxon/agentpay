@@ -102,7 +102,7 @@ import {
   type Attestation,
 } from "./attestations";
 import { callServiceTool, getService, listServices, quoteService, registryAvailable } from "./registry";
-import { applyTrustMultiplier, decidePayTrust, fetchReputation, trustPayMode } from "./trust";
+import { applyTrustMultiplier, decidePayTrust, fetchReputation, resolveBountyAccount, trustPayMode } from "./trust";
 import {
   bountyPayoutInfo,
   bountyRecord,
@@ -916,9 +916,10 @@ function publicReportLink(link: import("./reports").ReportLinkRow) {
 // ---------- proof-of-spend attestations ----------
 
 async function issueAttestation(c: ApiContext, walletId: string): Promise<Response> {
-  const body = (await c.req.json().catch(() => ({}))) as { days?: unknown };
+  const body = (await c.req.json().catch(() => ({}))) as { days?: unknown; sub?: unknown };
   const days = clampAttestationDays(body.days);
-  const attestation = await buildAttestation(c.env.DB, walletId, days);
+  const sub = cleanStr(body.sub, 120);
+  const attestation = await buildAttestation(c.env.DB, walletId, days, sub ? { sub } : {});
   if (!attestation) throw new HttpError(400, "No settled payments in this window — nothing to attest yet");
   const signed = await signAttestation(c.env, attestation);
   if (!signed) assertSigningConfigured();
@@ -1177,9 +1178,11 @@ api.post("/agent/pay-service", async (c) => {
   // 1b. Two-way trust (work -> spend): reputation fast-paths approval x2.
   // Read-only, fail closed. Mode defaults to log-only for 3 days.
   const trustMode = trustPayMode(c.env);
-  const bountyAccount =
+  const suppliedAccount =
     typeof body.bountyAccount === "number" && Number.isFinite(body.bountyAccount) ? Math.floor(body.bountyAccount) : null;
-  const reputation = trustMode === "off" ? null : await fetchReputation(c.env, bountyAccount);
+  // Binding: supplied account honored only if linked to this wallet.
+  const bountyAccount = trustMode === "off" ? null : await resolveBountyAccount(c.env.DB, wallet.id, suppliedAccount);
+  const reputation = await fetchReputation(c.env, bountyAccount);
   const trustDecision = decidePayTrust(reputation);
   const trustApplied = trustMode === "enforce" && trustDecision.fastPath;
   const basePolicy = await getAgentPolicy(c.env.DB, agent.id);
@@ -1392,20 +1395,34 @@ api.get("/bounties/:id", async (c) => {
 api.post("/bounties/:id/claim", async (c) => {
   const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
   const id = c.req.param("id");
-  const body = (await c.req.json().catch(() => ({}))) as { payoutAddress?: unknown };
+  const body = (await c.req.json().catch(() => ({}))) as {
+    payoutAddress?: unknown;
+    workerAccount?: unknown;
+    workerPubKey?: unknown;
+  };
   const payoutAddress =
     typeof body.payoutAddress === "string" ? body.payoutAddress.trim() : null;
   if (payoutAddress && !isValidBsvAddress(payoutAddress)) {
     throw new HttpError(400, "payoutAddress is not a valid BSV P2PKH address");
   }
+  const workerAccount =
+    typeof body.workerAccount === "number" && Number.isFinite(body.workerAccount)
+      ? Math.floor(body.workerAccount)
+      : null;
+  const workerPubKey = cleanStr(body.workerPubKey, 120);
   const workerRef = workerRefFor(wallet.id);
-  const claim = await claimBountyRemote(c.env, id, workerRef);
+  const claim = await claimBountyRemote(c.env, id, workerRef, {
+    workerPubKey: workerPubKey || undefined,
+    workerAccount: workerAccount ?? undefined,
+  });
   const record = bountyRecord(claim);
   const link = await linkBounty(c.env.DB, {
     bountyId: id,
     walletId: wallet.id,
     agentId: agent.id,
     workerRef,
+    workerAccount,
+    workerPubkey: workerPubKey || null,
     title: cleanStr(record?.title, 120),
     amountSats: typeof record?.amountSats === "number" ? record.amountSats : null,
     payoutAddress,

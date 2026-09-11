@@ -222,6 +222,8 @@ CREATE TABLE IF NOT EXISTS ap_bounty_links (
   wallet_id TEXT NOT NULL REFERENCES ap_wallets(id) ON DELETE CASCADE,
   agent_id TEXT,
   worker_ref TEXT NOT NULL,
+  worker_account INTEGER,
+  worker_pubkey TEXT,
   title TEXT NOT NULL DEFAULT '',
   amount_sats INTEGER,
   status TEXT NOT NULL DEFAULT 'claimed' CHECK (status IN ('claimed', 'submitted', 'paid', 'refunded')),

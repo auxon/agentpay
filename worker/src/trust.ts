@@ -103,20 +103,47 @@ export async function fetchReputation(
   }
 }
 
-/** Resolve the worker's bounty account from the wallet's most recent link. */
-export async function linkedBountyAccount(db: D1Database, walletId: string): Promise<number | null> {
+/** All bounty accounts linked to this wallet (via agentpay claims). */
+export async function linkedBountyAccounts(db: D1Database, walletId: string): Promise<number[]> {
   try {
-    const row = await db
-      .prepare("SELECT worker_ref FROM ap_bounty_links WHERE wallet_id = ? ORDER BY updated_at DESC LIMIT 1")
+    await db.prepare("ALTER TABLE ap_bounty_links ADD COLUMN worker_account INTEGER").run().catch(() => {});
+    const res = await db
+      .prepare("SELECT DISTINCT worker_account AS n FROM ap_bounty_links WHERE wallet_id = ? AND worker_account IS NOT NULL")
       .bind(walletId)
-      .first<{ worker_ref: string }>();
-    if (!row?.worker_ref) return null;
-    // worker_ref for agentpay links is `agentpay:<walletId>`; the numeric
-    // account (if known) is stored via claim metadata — try to parse a
-    // trailing #N hint, else fall back to null (no gating, fail closed).
-    const m = /#(\d+)\b/.exec(row.worker_ref);
-    return m ? Number(m[1]) : null;
+      .all<{ n: number }>();
+    return (res.results ?? []).map((r) => Number(r.n)).filter((n) => Number.isFinite(n));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolve the worker's bounty account: most recent linked account.
+ * A client-supplied account is honored ONLY if already linked to this
+ * wallet (prevents spoofing other workers' reputations). Fail closed.
+ */
+export async function resolveBountyAccount(
+  db: D1Database,
+  walletId: string,
+  supplied: number | null,
+): Promise<number | null> {
+  const linked = await linkedBountyAccounts(db, walletId);
+  if (supplied !== null && linked.includes(supplied)) return supplied;
+  try {
+    await db.prepare("ALTER TABLE ap_bounty_links ADD COLUMN worker_account INTEGER").run().catch(() => {});
+    const row = await db
+      .prepare(
+        "SELECT worker_account AS n FROM ap_bounty_links WHERE wallet_id = ? AND worker_account IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+      )
+      .bind(walletId)
+      .first<{ n: number }>();
+    return row?.n ?? null;
   } catch {
     return null;
   }
+}
+
+/** Legacy helper: most recent linked account (no supplied override). */
+export async function linkedBountyAccount(db: D1Database, walletId: string): Promise<number | null> {
+  return resolveBountyAccount(db, walletId, null);
 }
