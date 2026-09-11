@@ -584,8 +584,29 @@ api.get("/connect", async (c) => {
       curl: `curl -s -X POST ${mcpUrl} -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | head -c 300`,
     },
     firstTool: "onboard",
+    skill: `${PUBLIC_SITE}${API_PREFIX}/skill`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
     starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
+  });
+});
+
+/** Trial faucet: one funded starter wallet per IP per day (operator-gated). */
+api.post("/trial", async (c) => {
+  const { claimTrial, trialResponse } = await import("./trial");
+  const ip =
+    c.req.header("CF-Connecting-IP")?.split(",")[0]?.trim() ||
+    c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "anon";
+  const body = (await c.req.json().catch(() => ({}))) as { name?: unknown };
+  const claim = await claimTrial(c.env.DB, c.env, ip, body.name);
+  return c.json(trialResponse(claim, siteOrigin(c.req.raw)), 201);
+});
+
+/** Published skill: one fetchable playbook for agent harnesses. */
+api.get("/skill", async (c) => {
+  const { AGENTPAY_SKILL_MD } = await import("./skill");
+  return new Response(AGENTPAY_SKILL_MD, {
+    headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "public, max-age=3600" },
   });
 });
 

@@ -227,6 +227,15 @@ export default function App() {
 
           {tab === "wallet" && (
             <>
+              {data.agents.length === 0 && (
+                <QuickStartCard
+                  data={data}
+                  token={token}
+                  onChanged={() => void refresh()}
+                  onNotice={setNotice}
+                  onError={setError}
+                />
+              )}
               <PlanCard data={data} token={token} onUpgrade={startUpgrade} onError={setError} />
               <ApprovalsCard
                 data={data}
@@ -291,6 +300,98 @@ export default function App() {
         </span>
       </footer>
     </div>
+  );
+}
+
+function QuickStartCard({
+  data,
+  token,
+  onChanged,
+  onNotice,
+  onError,
+}: {
+  data: WalletResponse;
+  token: string;
+  onChanged: () => void;
+  onNotice: (s: string) => void;
+  onError: (s: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [key, setKey] = useState<string | null>(null);
+  const funded = data.wallet.balanceCents >= 500;
+  const endpoint = mcpEndpoint();
+
+  async function fund() {
+    setBusy(true);
+    try {
+      const res = await api<{ url: string }>("/wallets/me/topup", {
+        method: "POST",
+        token,
+        body: { amountCents: 500 },
+      });
+      window.location.href = res.url;
+    } catch (err) {
+      onError(message(err));
+      setBusy(false);
+    }
+  }
+
+  async function mint() {
+    setBusy(true);
+    try {
+      const res = await api<{ key: string }>("/wallets/me/agents", {
+        method: "POST",
+        token,
+        body: { name: "starter", dailyLimitCents: 500, approvalAboveCents: 100 },
+      });
+      setKey(res.key);
+      onNotice("Starter key minted — paste it into your agent's MCP config below.");
+      onChanged();
+    } catch (err) {
+      onError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card hero">
+      <h1>Get an agent spending in 2 minutes</h1>
+      <ol className="steps">
+        <li className={funded ? "done" : "now"}>
+          <strong>Fund $5.00</strong> with a card via Stripe.
+          {!funded && (
+            <button className="primary" disabled={busy} onClick={() => void fund()}>
+              {busy ? "Opening…" : "Fund $5.00"}
+            </button>
+          )}
+        </li>
+        <li className={!funded ? "" : key ? "done" : "now"}>
+          <strong>Mint a starter key</strong> — $5/day limit, approvals above $1.
+          {funded && !key && (
+            <button className="primary" disabled={busy} onClick={() => void mint()}>
+              {busy ? "Minting…" : "Mint starter key"}
+            </button>
+          )}
+        </li>
+        <li className={key ? "now" : ""}>
+          <strong>Connect</strong> — paste the key into your agent's MCP config.
+        </li>
+      </ol>
+      {key && (
+        <>
+          <CopyField label="Starter key (agp_… — shown once)" value={key} />
+          <CodeBlock
+            code={`claude mcp add --transport http agentpay ${endpoint} \\\n  --header "Authorization: Bearer ${key}"`}
+          />
+          <p className="fine">
+            opencode / Cursor / VS Code / curl variants with this key embedded are in{" "}
+            <strong>Connect your agent</strong> below — or hand the key to the agent and tell it to call the{" "}
+            <code>onboard</code> tool first.
+          </p>
+        </>
+      )}
+    </section>
   );
 }
 

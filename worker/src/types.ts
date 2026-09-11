@@ -70,6 +70,12 @@ export interface AppEnv {
   /** Optional operator webhook for treasury_low alerts (POST JSON). */
   TREASURY_ALERT_URL?: string;
   TREASURY_ALERT_SECRET?: string;
+  /** Trial faucet: TRIAL_ENABLED="1" gates POST /trial + claim_trial. */
+  TRIAL_ENABLED?: string;
+  /** Trial wallet funding in cents (default 25, max 500). */
+  TRIAL_CENTS?: string;
+  /** Operator lifetime trial budget in cents (default 1000 = $10). */
+  TRIAL_TOTAL_CAP_CENTS?: string;
   /** Monthly Pro price in USD cents (default 2900). */
   PRO_PRICE_CENTS?: string;
   /** Optional pre-created Stripe price for Pro; falls back to an ad-hoc monthly price. */

@@ -446,6 +446,27 @@ input:focus {
   letter-spacing: -0.5px;
 }
 
+/* ---------- quick start ---------- */
+.steps {
+  margin: 12px 0;
+  padding-left: 22px;
+  display: grid;
+  gap: 10px;
+}
+.steps li::marker {
+  font-weight: 700;
+}
+.steps li.done {
+  color: var(--muted);
+}
+.steps li.now strong {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.steps .primary {
+  margin-left: 10px;
+}
+
 .footer {
   margin-top: 30px;
   color: var(--muted);

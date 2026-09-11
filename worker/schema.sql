@@ -260,3 +260,14 @@ CREATE TABLE IF NOT EXISTS ap_bounty_escrows (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ap_bounty_escrows_wallet ON ap_bounty_escrows(wallet_id, created_at DESC);
+
+-- Trial faucet claims: one funded starter wallet per IP per UTC day.
+-- UNIQUE(ip_hash, day) makes concurrent double-claims fail closed.
+CREATE TABLE IF NOT EXISTS ap_trial_claims (
+  ip_hash TEXT NOT NULL,
+  day TEXT NOT NULL,
+  wallet_id TEXT NOT NULL DEFAULT '',
+  amount_cents INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (ip_hash, day)
+);

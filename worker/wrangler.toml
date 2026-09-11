@@ -31,6 +31,10 @@ PRO_PRICE_CENTS = "2900"
 # STRIPE_PRICE_PRO = "price_..."
 # x402 rail
 X402_MAX_SATS = "10000"
+# Per-tx miner fee in sats. ARC raised its relay minimum (60+ sats for a
+# typical funding tx); 100 gives headroom while staying far below the
+# 1-cent minimum charge. 2026-09-11: 30 sats rejected by ARC (fee too low).
+X402_FEE_SATS = "100"
 X402_MIN_TREASURY_SATS = "5000"
 # Optional: sats per USD cent for automatic pay_service pricing.
 # Unset = charge the 1-cent minimum per paid call.
@@ -41,6 +45,11 @@ X402_MIN_TREASURY_SATS = "5000"
 # Two-way trust (work -> spend): off | log | enforce. Default log for 3-day
 # observation per CEO #3; flip to enforce after review. Never raises limits.
 TRUST_GATE_PAY = "log"
+# Trial faucet (self-serve onboarding): set TRIAL_ENABLED = "1" to let agents
+# mint one pre-funded starter wallet per IP per day. Operator-budget-capped.
+# TRIAL_ENABLED = "0"
+# TRIAL_CENTS = "25"
+# TRIAL_TOTAL_CAP_CENTS = "1000"
 # Secrets (wrangler secret put):
 #   STRIPE_SECRET_KEY       restricted rk_live_… / rk_test_… — needs Checkout
 #                           Sessions (write), Customers (write), Subscriptions

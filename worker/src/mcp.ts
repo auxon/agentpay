@@ -20,6 +20,7 @@ export const MCP_VERSION = "0.1.0";
 export const MCP_TOOLS = [
   "health",
   "onboard",
+  "claim_trial",
   "get_balance",
   "create_topup_link",
   "create_upgrade_link",
@@ -48,7 +49,8 @@ export const MCP_INSTRUCTIONS = [
   "Human dashboard: https://entangleit.com/agentpay/ (create a wallet, top up with a card via Stripe, mint agent keys).",
   "Agents authenticate with a scoped key (agp_…). Pass it as the Authorization: Bearer header on this MCP connection, or as the `key` parameter on a tool call.",
   "New agents call onboard first: it inspects balance, claims, and history, then returns the single next action.",
-  "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges.",
+  "No key yet: claim_trial mints a pre-funded trial wallet + key (one per IP per day). Full playbook: https://entangleit.com/api/agentpay/skill.",
+  "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges. claim_trial mints a pre-funded trial wallet + key with no human needed (operator-gated, one per IP per day).",
   "Wallet tools: get_balance, list_transactions, get_receipt.",
   "Spending: spend debits the wallet and writes a receipt. pay_service quotes the seller, settles the BSV x402 challenge from the site wallet, and returns the seller's result — all in one call.",
   "pay_service takes params (tool arguments) and optional amountCents. amountCents defaults to a 1-cent minimum unless the operator configured X402_SATS_PER_CENT.",
@@ -552,6 +554,23 @@ export function createAgentPayMcpServer(
     },
     async ({ key }) => {
       const { status, json } = await call("GET", "/agent/bounties/escrows", { key });
+      if (status >= 400) return fail(status, json);
+      return ok(json);
+    },
+  );
+
+  server.registerTool(
+    "claim_trial",
+    {
+      title: "Claim a trial wallet",
+      description:
+        "Self-serve onboarding: mint a real wallet pre-funded with trial credit plus a tight agent key. No human or card needed. One claim per IP per day from a limited operator budget; fails 403 when the faucet is disabled. Free.",
+      inputSchema: z.object({
+        name: z.string().max(60).optional().describe("Wallet name, e.g. trial-bot"),
+      }),
+    },
+    async ({ name }) => {
+      const { status, json } = await call("POST", "/trial", { body: { name } });
       if (status >= 400) return fail(status, json);
       return ok(json);
     },
