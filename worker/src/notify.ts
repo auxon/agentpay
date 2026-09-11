@@ -387,6 +387,52 @@ export async function notifyBudgetExhausted(
   await dispatchEvent(env, walletId, "budget_exhausted", input);
 }
 
+const TREASURY_ALERT_DEDUPE_MS = 3_600_000;
+
+/**
+ * Operator treasury_low alert (Phase D). Fires at most hourly, never throws,
+ * never blocks money. Configure TREASURY_ALERT_URL (+ optional
+ * TREASURY_ALERT_SECRET bearer) to receive it.
+ */
+export async function maybeAlertTreasury(
+  env: AppEnv,
+  db: D1Database,
+  status: { low: boolean; sats: number | null; thresholdSats: number },
+): Promise<void> {
+  try {
+    if (!status.low) return;
+    const url = env.TREASURY_ALERT_URL?.trim();
+    if (!url) return;
+    const last = await db
+      .prepare("SELECT updated_at FROM ap_meta WHERE key = 'treasury_alerted_at'")
+      .first<{ updated_at: string }>()
+      .catch(() => null);
+    if (last?.updated_at && Date.now() - Date.parse(last.updated_at) < TREASURY_ALERT_DEDUPE_MS) return;
+    await db
+      .prepare(
+        "INSERT INTO ap_meta (key, value, updated_at) VALUES ('treasury_alerted_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+      )
+      .bind(String(status.sats ?? -1), nowIso())
+      .run()
+      .catch(() => {});
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(env.TREASURY_ALERT_SECRET ? { authorization: `Bearer ${env.TREASURY_ALERT_SECRET}` } : {}),
+      },
+      body: JSON.stringify({
+        event: "treasury_low",
+        sats: status.sats,
+        thresholdSats: status.thresholdSats,
+        at: nowIso(),
+      }),
+    }).catch(() => {});
+  } catch {
+    /* alerting never fails the request */
+  }
+}
+
 export function cleanWebhookLabel(value: unknown): string {
   return cleanStr(value, 80);
 }

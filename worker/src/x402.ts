@@ -80,12 +80,16 @@ export function maxPaymentSats(env: AppEnv): number {
 
 /**
  * What to charge the agent wallet (integer cents, min 1).
- * Explicit `amountCents` wins; else convert with X402_SATS_PER_CENT; else 1 cent.
+ * Explicit `amountCents` wins; else convert with the resolved oracle rate
+ * (perCent), else X402_SATS_PER_CENT; else 1 cent.
  */
-export function chargeCentsFor(sats: number, env: AppEnv, override?: unknown): number {
+export function chargeCentsFor(sats: number, env: AppEnv, override?: unknown, perCent?: number): number {
   if (Number.isInteger(override) && (override as number) >= 1) return override as number;
-  const perCent = Number.parseInt(String(env.X402_SATS_PER_CENT ?? ""), 10);
-  if (Number.isFinite(perCent) && perCent > 0) return Math.max(1, Math.ceil(sats / perCent));
+  if (perCent !== undefined && Number.isFinite(perCent) && perCent > 0) {
+    return Math.max(1, Math.ceil(sats / perCent));
+  }
+  const cfg = Number.parseInt(String(env.X402_SATS_PER_CENT ?? ""), 10);
+  if (Number.isFinite(cfg) && cfg > 0) return Math.max(1, Math.ceil(sats / cfg));
   return 1;
 }
 
@@ -349,7 +353,7 @@ function b64encodeJson(obj: unknown): string {
 export async function prepareBsvPayment(
   env: AppEnv,
   requirements: BsvRequirements,
-): Promise<{ txid: string; paymentSignature: string; address: string; satoshis: number }> {
+): Promise<{ txid: string; paymentSignature: string; address: string; satoshis: number; payer: string }> {
   const wif = env.SITE_WALLET_WIF?.trim();
   if (!wif) throw new HttpError(503, "BSV rail is not configured (site wallet WIF missing)");
   let key: PrivateKey;
@@ -396,5 +400,27 @@ export async function prepareBsvPayment(
     }),
     address,
     satoshis: requirements.satoshis,
+    // Mirrors the gateway's payer derivation (verifyBsvPayment): binds trust
+    // attestations to this exact payment so they cannot be replayed.
+    payer: payerForTx(tx),
   };
+}
+
+/** Payer identity for trust binding. Must match the gateway's derivation. */
+export function payerForTx(tx: {
+  inputs: Array<{ sourceTXID?: unknown; sourceTransaction?: { id?: (...args: never[]) => unknown } }>;
+}): string {
+  try {
+    const first = tx.inputs[0];
+    const rawTxid = typeof first?.sourceTXID === "string" ? first.sourceTXID : "";
+    const viaTx =
+      !rawTxid && typeof first?.sourceTransaction?.id === "function"
+        ? String(first.sourceTransaction.id("hex" as never) ?? "")
+        : "";
+    const ref = rawTxid || viaTx;
+    if (ref) return `bsv:input:${ref.slice(0, 16)}`;
+  } catch {
+    /* fall through */
+  }
+  return "bsv:unknown";
 }

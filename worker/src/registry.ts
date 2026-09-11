@@ -149,6 +149,8 @@ export interface ServiceQuote {
 export interface ServiceCallOptions {
   params?: Record<string, unknown>;
   paymentSignature?: string | null;
+  /** Bound trust attestation envelope for seller discounts (Phase E). */
+  trustAttestation?: string | null;
   timeoutMs?: number;
 }
 
@@ -165,6 +167,7 @@ export async function callServiceTool(
   let url = tool.path;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (opts.paymentSignature) headers["PAYMENT-SIGNATURE"] = opts.paymentSignature;
+  if (opts.trustAttestation) headers["X-Trust-Attestation"] = opts.trustAttestation;
   const params = { ...(opts.params ?? {}) };
 
   for (const key of Object.keys(params)) {

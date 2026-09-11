@@ -274,13 +274,14 @@ export function createAgentPayMcpServer(
         ref: z.string().optional(),
         approvalId: z.string().optional().describe("Approval id from a prior approval_required response"),
         bountyAccount: z.number().int().positive().optional().describe("BSVBounties account # for trust fast-path"),
+        dryRun: z.boolean().optional().describe("Sandbox: quote + policy check only, no debit or settlement"),
         key: keyField,
       }),
     },
-    async ({ serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount, key }) => {
+    async ({ serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount, dryRun, key }) => {
       const { status, json } = await call("POST", "/agent/pay-service", {
         key,
-        body: { serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount },
+        body: { serviceId, tool, params, amountCents, description, ref, approvalId, bountyAccount, dryRun },
       });
       if (status >= 400) return fail(status, json);
       return ok(json);

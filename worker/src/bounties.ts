@@ -100,9 +100,11 @@ export function satsPerCent(env: AppEnv): number {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SATS_PER_CENT;
 }
 
-export function centsForSats(sats: number, env: AppEnv): number {
-  const perCent = satsPerCent(env);
-  return Math.max(1, Math.round(sats / perCent));
+export function centsForSats(sats: number, env: AppEnv, perCent?: number): number {
+  const rate = perCent ?? satsPerCent(env);
+  // Ceil everywhere (matches chargeCentsForSats): the treasury never sells
+  // sats below the posted rate, in either direction.
+  return Math.max(1, Math.ceil(sats / rate));
 }
 
 function baseUrl(env: AppEnv): string {
@@ -292,7 +294,9 @@ export async function creditBountyPayout(
   if (!Number.isFinite(amountSats) || amountSats <= 0) {
     throw new HttpError(400, "Bounty amountSats must be a positive integer");
   }
-  const amountCents = centsForSats(amountSats, env);
+  const { resolveSatsPerCent } = await import("./price");
+  const { perCent, source } = await resolveSatsPerCent(env, db, satsPerCent(env));
+  const amountCents = centsForSats(amountSats, env, perCent);
   const ref = `bounty:${input.bountyId}`;
 
   const claimed = await db
@@ -340,7 +344,8 @@ export async function creditBountyPayout(
         type: "bounty_payout",
         bountyId: input.bountyId,
         amountSats,
-        satsPerCent: satsPerCent(env),
+        satsPerCent: perCent,
+        priceSource: source,
         settleTxid: input.settleTxid ?? null,
         description: "Bounty payout",
       }),
@@ -417,8 +422,8 @@ export function isValidBsvAddress(value: unknown): value is string {
 }
 
 /** Charges round up so treasury sats never sell below the posted rate. */
-export function chargeCentsForSats(amountSats: number, env: AppEnv): number {
-  return Math.max(1, Math.ceil(amountSats / satsPerCent(env)));
+export function chargeCentsForSats(amountSats: number, env: AppEnv, perCent?: number): number {
+  return Math.max(1, Math.ceil(amountSats / (perCent ?? satsPerCent(env))));
 }
 
 async function bountiesInternalJson(
@@ -496,7 +501,9 @@ export async function postFundedBounty(
     throw new HttpError(400, "payoutAddress is not a valid BSV P2PKH address");
   }
 
-  const amountCents = chargeCentsForSats(amountSats, env);
+  const { resolveSatsPerCent: resolvePostRate } = await import("./price");
+  const postRate = await resolvePostRate(env, db, satsPerCent(env));
+  const amountCents = chargeCentsForSats(amountSats, env, postRate.perCent);
   const feeBps = feeBpsFromEnv(env);
   const minFeeSats = spendFeeSats(env, 2) + 1;
   if (Math.floor((amountSats * feeBps) / 10_000) < minFeeSats) {

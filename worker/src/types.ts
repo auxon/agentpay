@@ -67,6 +67,9 @@ export interface AppEnv {
   X402_ALLOW_UNCONFIRMED?: string;
   /** Treasury balance (sats) below which /health flags `low`. */
   X402_MIN_TREASURY_SATS?: string;
+  /** Optional operator webhook for treasury_low alerts (POST JSON). */
+  TREASURY_ALERT_URL?: string;
+  TREASURY_ALERT_SECRET?: string;
   /** Monthly Pro price in USD cents (default 2900). */
   PRO_PRICE_CENTS?: string;
   /** Optional pre-created Stripe price for Pro; falls back to an ad-hoc monthly price. */
@@ -96,6 +99,8 @@ export interface AppEnv {
   /** ARC endpoint for escrow broadcasts (default GorillaPool) + optional key. */
   ARC_URL?: string;
   ARC_API_KEY?: string;
+  /** Optional second ARC endpoint tried when ARC_URL fails. */
+  ARC_FALLBACK_URL?: string;
 }
 
 export interface WalletRow {

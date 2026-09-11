@@ -70,6 +70,7 @@ import {
   isValidWebhookUrl,
   listDeliveries,
   lowBalanceDefault,
+  maybeAlertTreasury,
   notifyApprovalDecided,
   notifyApprovalRequired,
   notifyBudgetExhausted,
@@ -103,6 +104,7 @@ import {
 } from "./attestations";
 import { callServiceTool, getService, listServices, quoteService, registryAvailable } from "./registry";
 import { applyTrustMultiplier, decidePayTrust, fetchReputation, resolveBountyAccount, trustPayMode } from "./trust";
+import { getCachedBsvUsd } from "./price";
 import {
   bountyPayoutInfo,
   bountyRecord,
@@ -501,12 +503,58 @@ api.get("/health", async (c) => {
     stripe: stripeConfigured(env),
     livemode: stripeEnvLivemode(env),
     registry: await registryAvailable(env.DB),
+    price: await getCachedBsvUsd(env.DB)
+      .then((p) => (p ? { usd: p.usd, atMs: p.atMs, source: "coingecko" } : { usd: null, source: "configured" }))
+      .catch(() => ({ usd: null, source: "configured" })),
     x402: {
       siteWalletConfigured: siteWalletConfigured(env),
       siteWalletAddress: siteWalletAddress(env),
       maxPaymentSats: maxPaymentSats(env),
       treasury,
     },
+  });
+});
+
+/** One-page agent starter: wallet → key → bounty account → fund → spend. */
+api.get("/start", async (c) => {
+  const base = `${PUBLIC_SITE}${API_PREFIX}`;
+  return c.json({
+    steps: [
+      { n: 1, title: "Create a wallet (human, once)", method: "POST", path: "/wallets", body: { name: "My agent wallet", email: "you@example.com" }, returns: "wallet token (apw_…) + recovery code — store both" },
+      { n: 2, title: "Top up with a card", method: "POST", path: "/wallets/me/topup", auth: "apw_…", returns: "Stripe Checkout URL for a human to open" },
+      { n: 3, title: "Mint a scoped agent key", method: "POST", path: "/wallets/me/agents", auth: "apw_…", body: { name: "worker-1", dailyLimitCents: 500 }, returns: "agent key (agp_…) — spend-only, never withdraws" },
+      { n: 4, title: "Mint a bounty account + claim through agentpay", tool: "claim_bounty", body: { bountyId: "<id>", workerAccount: "<your #N>", workerPubKey: "<your key>" }, note: "Claiming through agentpay links wallet↔account for payouts, reputation fast-path, and bond discount" },
+      { n: 5, title: "Dry-run a paid call (no charge)", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", dryRun: true }, note: "Returns quote + would-be charge + trust evaluation without debiting" },
+      { n: 6, title: "Spend for real", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", params: {} } },
+    ],
+    mcp: `${PUBLIC_SITE}${MCP_PATH}`,
+    docs: `${PUBLIC_SITE}/agentpay/docs/`,
+    base,
+  });
+});
+
+/** Machine-readable agent card: MCP endpoint, tools, registry, trust rails. */
+api.get("/agent-card", async (c) => {
+  const { MCP_TOOLS } = await import("./mcp");
+  return c.json({
+    name: "agentpay",
+    version: "0.1.0",
+    site: `${PUBLIC_SITE}/agentpay/`,
+    docs: `${PUBLIC_SITE}/agentpay/docs/`,
+    mcp: { endpoint: `${PUBLIC_SITE}${MCP_PATH}`, transport: "streamable-http", auth: "Bearer agp_… (header or per-tool key)" },
+    tools: MCP_TOOLS,
+    registry: `${PUBLIC_SITE}/x402market/`,
+    trust: {
+      attestations: {
+        issue: "POST /agent/attestation {days?, sub?}",
+        verify: "POST /attestations/verify {attestation, signature}",
+        publicKey: "GET /attestations/key",
+      },
+      reputationFastPath: "pay_service {bountyAccount} → approval threshold x2 when score>=650",
+      bondDiscount: "claim_bounty {attestation, attestationSignature} → 50% worker bond off when eligible",
+      sandbox: "pay_service {dryRun:true} → quote + policy check, no charge",
+    },
+    starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
   });
 });
 
@@ -1149,6 +1197,7 @@ api.post("/agent/pay-service", async (c) => {
     ref?: unknown;
     approvalId?: unknown;
     bountyAccount?: unknown;
+    dryRun?: unknown;
   };
   const serviceId = cleanStr(body.serviceId, 80);
   const toolName = cleanStr(body.tool, 80);
@@ -1173,7 +1222,13 @@ api.post("/agent/pay-service", async (c) => {
   // 1. Live 402 challenge from the seller.
   const quote = await quoteService(c.env.DB, serviceId, toolName);
   const requirements = parseBsvRequirements(quote.requirements);
-  const amountCents = chargeCentsFor(requirements.satoshis, c.env, body.amountCents);
+  const { resolveSatsPerCent } = await import("./price");
+  const quoteRate = await resolveSatsPerCent(
+    c.env,
+    c.env.DB,
+    Number(String(c.env.X402_SATS_PER_CENT ?? "")) || 0 || 40_000,
+  );
+  const amountCents = chargeCentsFor(requirements.satoshis, c.env, body.amountCents, quoteRate.perCent);
 
   // 1b. Two-way trust (work -> spend): reputation fast-paths approval x2.
   // Read-only, fail closed. Mode defaults to log-only for 3 days.
@@ -1200,8 +1255,25 @@ api.post("/agent/pay-service", async (c) => {
     discountEligible: trustDecision.fastPath,
   };
 
-  // 1c. Scope + approval gate (no funds move until this passes).
+  // 1c. Sandbox dry-run: quote + policy evaluation, zero side effects.
+  // No debit, no approval row, no settlement — for devs validating pricing.
   const approvalId = cleanStr(body.approvalId, 80);
+  if (body.dryRun === true) {
+    return c.json({
+      dryRun: true,
+      quote,
+      satoshis: requirements.satoshis,
+      payTo: requirements.payTo,
+      chargedCents: amountCents,
+      listPriceSats: tool.priceSats,
+      wouldRequireApproval:
+        effectiveThreshold !== null && amountCents >= effectiveThreshold && !approvalId,
+      trust,
+      note: "Dry run — nothing was debited or settled. Omit dryRun to execute.",
+    });
+  }
+
+  // 1d. Scope + approval gate (no funds move until this passes).
   const gate = await gateSpend(c, {
     wallet,
     agent,
@@ -1249,13 +1321,38 @@ api.post("/agent/pay-service", async (c) => {
         settlement: "bsv",
         payTo: requirements.payTo,
         satoshis: requirements.satoshis,
+        satsPerCent: quoteRate.perCent,
+        priceSource: quoteRate.source,
         txid: prepared.txid,
       },
     });
 
     let res: Response;
+    // Bound trust attestation for seller discounts (Phase E): minted with
+    // sub=payer so the seller can verify binding. Best-effort, never blocks.
+    let trustAttestation: string | null = null;
     try {
-      res = await callServiceTool(service, tool, { params, paymentSignature: prepared.paymentSignature });
+      const { buildAttestation, signAttestation } = await import("./attestations");
+      const att = await buildAttestation(c.env.DB, wallet.id, 30, { sub: prepared.payer });
+      if (att) {
+        const signed = await signAttestation(c.env, att);
+        if (signed) {
+          const env = { attestation: att, signature: signed.signature, keyId: signed.keyId };
+          trustAttestation = btoa(JSON.stringify(env))
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+        }
+      }
+    } catch {
+      trustAttestation = null;
+    }
+    try {
+      res = await callServiceTool(service, tool, {
+        params,
+        paymentSignature: prepared.paymentSignature,
+        trustAttestation,
+      });
     } catch (e) {
       await refundSpend(c.env.DB, {
         walletId: wallet.id,
@@ -1307,6 +1404,11 @@ api.post("/agent/pay-service", async (c) => {
     }
 
     c.executionCtx.waitUntil(afterSpend(c, wallet, charged));
+    c.executionCtx.waitUntil(
+      treasuryStatus(c.env.DB, c.env)
+        .then((t) => maybeAlertTreasury(c.env, c.env.DB, t))
+        .catch(() => {}),
+    );
     return c.json({
       receipt: publicReceipt(charged.receipt),
       balanceCents: charged.balanceCents,
@@ -1315,6 +1417,8 @@ api.post("/agent/pay-service", async (c) => {
       network: "bsv:mainnet",
       txid: prepared.txid,
       satoshis: requirements.satoshis,
+      listPriceSats: tool.priceSats,
+      discountSats: Math.max(0, tool.priceSats - requirements.satoshis),
       payTo: requirements.payTo,
       chargedCents: amountCents,
       paymentResponse: paymentResponse ? safeParseB64(paymentResponse) : null,
@@ -1462,6 +1566,11 @@ api.post("/agent/bounties", async (c) => {
     deadline: typeof body.deadline === "number" ? body.deadline : undefined,
     payoutAddress: typeof body.payoutAddress === "string" ? body.payoutAddress : null,
   });
+  c.executionCtx.waitUntil(
+    treasuryStatus(c.env.DB, c.env)
+      .then((t) => maybeAlertTreasury(c.env, c.env.DB, t))
+      .catch(() => {}),
+  );
   return c.json({ ...result, payout: bountyPayoutInfo(c.env) }, 201);
 });
 

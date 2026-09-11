@@ -285,31 +285,48 @@ export async function fetchEscrowUtxos(address: string): Promise<SiteUtxo[]> {
 export async function arcBroadcastTx(
   env: AppEnv,
   txHex: string,
-): Promise<{ txid: string; raw: unknown }> {
-  const base = (env.ARC_URL || ARC_FALLBACK).replace(/\/$/, "");
+): Promise<{ txid: string; raw: unknown; via: string }> {
+  const primary = (env.ARC_URL || ARC_FALLBACK).replace(/\/$/, "");
+  const fallbacks = [primary, "https://arc.taal.com/v1"];
+  if (typeof env.ARC_FALLBACK_URL === "string" && env.ARC_FALLBACK_URL) {
+    fallbacks.splice(1, 0, env.ARC_FALLBACK_URL.replace(/\/$/, ""));
+  }
   const apiKey = env.ARC_API_KEY?.trim();
-  const res = await fetch(`${base}/tx`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(apiKey ? { authorization: `Bearer ${apiKey}`, "x-api-key": apiKey } : {}),
-      "xdeployment-id": "agentpay-bounties-v1",
-    },
-    body: JSON.stringify({ rawTx: txHex }),
-  });
-  const text = await res.text();
-  let json: Record<string, unknown> = {};
-  try {
-    json = JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    json = { raw: text.slice(0, 2000) };
+  let lastError = "";
+  for (const base of [...new Set(fallbacks)]) {
+    try {
+      const res = await fetch(`${base}/tx`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(apiKey ? { authorization: `Bearer ${apiKey}`, "x-api-key": apiKey } : {}),
+          "xdeployment-id": "agentpay-bounties-v1",
+        },
+        body: JSON.stringify({ rawTx: txHex }),
+      });
+      const text = await res.text();
+      let json: Record<string, unknown> = {};
+      try {
+        json = JSON.parse(text) as Record<string, unknown>;
+      } catch {
+        json = { raw: text.slice(0, 2000) };
+      }
+      if (!res.ok) {
+        lastError = `ARC rejected escrow broadcast (${res.status}): ${text.slice(0, 300)}`;
+        continue;
+      }
+      const txid =
+        (json.txid as string) ?? (json.txId as string) ?? (json.hash as string) ?? "";
+      if (!txid) {
+        lastError = `ARC ${base} accepted but returned no txid`;
+        continue;
+      }
+      return { txid, raw: json, via: base };
+    } catch (err) {
+      lastError = `ARC ${base} unreachable: ${(err as Error).message}`;
+    }
   }
-  if (!res.ok) {
-    throw new HttpError(502, `ARC rejected escrow broadcast (${res.status}): ${text.slice(0, 300)}`);
-  }
-  const txid =
-    (json.txid as string) ?? (json.txId as string) ?? (json.hash as string) ?? "";
-  return { txid, raw: json };
+  throw new HttpError(502, lastError || "All ARC endpoints failed");
 }
 
 // ---------- escrow rows ----------
