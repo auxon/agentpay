@@ -45,9 +45,9 @@ X402_MIN_TREASURY_SATS = "5000"
 # Two-way trust (work -> spend): off | log | enforce. Default log for 3-day
 # observation per CEO #3; flip to enforce after review. Never raises limits.
 TRUST_GATE_PAY = "log"
-# Trial faucet (self-serve onboarding): set TRIAL_ENABLED = "1" to let agents
-# mint one pre-funded starter wallet per IP per day. Operator-budget-capped.
-# TRIAL_ENABLED = "0"
+# Trial faucet (self-serve onboarding): agents mint one pre-funded starter
+# wallet per IP per day. Operator-budget-capped. Live 2026-09-11.
+TRIAL_ENABLED = "1"
 # TRIAL_CENTS = "25"
 # TRIAL_TOTAL_CAP_CENTS = "1000"
 # Secrets (wrangler secret put):
