@@ -70,6 +70,8 @@ export interface AppEnv {
   /** Optional operator webhook for treasury_low alerts (POST JSON). */
   TREASURY_ALERT_URL?: string;
   TREASURY_ALERT_SECRET?: string;
+  /** Google OAuth 2.0 Client ID for dashboard sign-in (GIS ID-token flow). */
+  GOOGLE_CLIENT_ID?: string;
   /** Trial faucet: TRIAL_ENABLED="1" gates POST /trial + claim_trial. */
   TRIAL_ENABLED?: string;
   /** Trial wallet funding in cents (default 25, max 500). */
@@ -142,6 +144,16 @@ export interface AgentRow {
 }
 
 /** A delegated child key: parent link + lifetime budget + expiry. */
+/** Google sign-in identity, mapped to one wallet. Raw ID tokens are never stored. */
+export interface GoogleUserRow {
+  google_sub: string;
+  email: string;
+  name: string;
+  wallet_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SubagentRow {
   agent_id: string;
   parent_agent_id: string;

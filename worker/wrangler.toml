@@ -50,6 +50,10 @@ TRUST_GATE_PAY = "log"
 TRIAL_ENABLED = "1"
 # TRIAL_CENTS = "25"
 # TRIAL_TOTAL_CAP_CENTS = "1000"
+# Google sign-in for the dashboard (GIS ID-token flow). Create an OAuth 2.0
+# Client ID in Google Cloud Console; no client secret needed.
+# wrangler secret put GOOGLE_CLIENT_ID   (or set as a plain var)
+# GOOGLE_CLIENT_ID = "…apps.googleusercontent.com"
 # Secrets (wrangler secret put):
 #   STRIPE_SECRET_KEY       restricted rk_live_… / rk_test_… — needs Checkout
 #                           Sessions (write), Customers (write), Subscriptions
