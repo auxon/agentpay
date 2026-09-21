@@ -14,13 +14,14 @@ import {
   type AgentRow,
   type AppEnv,
   type ApprovalRow,
+  type GoogleUserRow,
   type LedgerRow,
   type PlanState,
   type ReceiptRow,
   type SubagentRow,
   type WalletRow,
 } from "./types";
-import { requireAgent, requireWallet } from "./auth";
+import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
   agentSpendAllowed,
   agentToolAllowed,
@@ -135,7 +136,8 @@ import {
   treasuryStatus,
 } from "./x402";
 import { API_PREFIX, APP_PREFIX, MCP_PATH, PUBLIC_SITE, siteOrigin } from "./paths";
-import { cleanStr, nowIso, timingSafeEqualStr } from "./ids";
+import { cleanStr, nowIso, sha256Hex, timingSafeEqualStr } from "./ids";
+import { verifyGoogleIdToken } from "./google";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -513,6 +515,130 @@ api.get("/health", async (c) => {
       treasury,
     },
   });
+});
+
+// ---------- Google sign-in (public) ----------
+
+/** Google OAuth client id, or 501 when unconfigured. */
+function googleClientId(c: Context<{ Bindings: AppEnv }>): string {
+  const id = (c.env.GOOGLE_CLIENT_ID ?? "").trim();
+  if (!id) throw new HttpError(501, "Google login is not configured");
+  return id;
+}
+
+api.get("/auth/google/config", (c) => {
+  const clientId = (c.env.GOOGLE_CLIENT_ID ?? "").trim();
+  return c.json({ configured: !!clientId, clientId: clientId || null });
+});
+
+/** Rotate the wallet token and return the fresh one (only the hash is stored). */
+async function rotateWalletToken(db: D1Database, walletId: string): Promise<string> {
+  const token = mintWalletToken();
+  await db
+    .prepare("UPDATE ap_wallets SET token_hash = ?, updated_at = ? WHERE id = ?")
+    .bind(await sha256Hex(token), nowIso(), walletId)
+    .run();
+  return token;
+}
+
+/**
+ * Sign in with a Google ID token (GIS flow). New identity → new wallet + user
+ * row, returns the wallet token and a one-time recovery code. Returning
+ * identity → fresh wallet token (old sessions stop working).
+ */
+api.post("/auth/google", async (c) => {
+  const clientId = googleClientId(c);
+  const body = (await c.req.json().catch(() => ({}))) as { idToken?: unknown };
+  const idToken = String(body.idToken ?? "");
+  if (!idToken) throw new HttpError(400, "idToken is required");
+  let identity;
+  try {
+    identity = await verifyGoogleIdToken(idToken, clientId);
+  } catch (err) {
+    throw new HttpError(401, err instanceof Error ? err.message : "Invalid ID token");
+  }
+  const db = c.env.DB;
+  const existing = await db
+    .prepare("SELECT * FROM ap_users WHERE google_sub = ?")
+    .bind(identity.sub)
+    .first<GoogleUserRow>();
+  if (!existing) {
+    const { wallet, token, recoveryCode } = await createWallet(db, {
+      name: identity.name,
+      email: identity.email,
+    });
+    const t = nowIso();
+    await db
+      .prepare(
+        "INSERT INTO ap_users (google_sub, email, name, wallet_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .bind(identity.sub, identity.email, identity.name, wallet.id, t, t)
+      .run();
+    return c.json({
+      token,
+      walletId: wallet.id,
+      name: identity.name,
+      email: identity.email,
+      isNew: true,
+      recoveryCode,
+      note: "Store the recovery code now — it is shown only once and resets the wallet token if it is lost.",
+    });
+  }
+  const wallet = await db
+    .prepare("SELECT * FROM ap_wallets WHERE id = ? AND status = 'active'")
+    .bind(existing.wallet_id)
+    .first<WalletRow>();
+  if (!wallet) throw new HttpError(401, "Linked wallet is inactive");
+  await db
+    .prepare("UPDATE ap_users SET email = ?, name = ?, updated_at = ? WHERE google_sub = ?")
+    .bind(identity.email, identity.name, nowIso(), identity.sub)
+    .run();
+  const token = await rotateWalletToken(db, wallet.id);
+  return c.json({
+    token,
+    walletId: wallet.id,
+    name: identity.name,
+    email: identity.email,
+    isNew: false,
+    recoveryCode: null,
+    note: "A fresh wallet token was issued — sessions using the old token stop working.",
+  });
+});
+
+/**
+ * Attach a wallet created the old way (token, no Google identity) to the
+ * signer's Google identity. Idempotent per sub.
+ */
+api.post("/auth/google/link", async (c) => {
+  const clientId = googleClientId(c);
+  const body = (await c.req.json().catch(() => ({}))) as { idToken?: unknown; walletToken?: unknown };
+  const idToken = String(body.idToken ?? "");
+  const walletToken = String(body.walletToken ?? "").trim();
+  if (!idToken) throw new HttpError(400, "idToken is required");
+  if (!walletToken.startsWith(WALLET_TOKEN_PREFIX)) throw new HttpError(401, "That is not a wallet token");
+  let identity;
+  try {
+    identity = await verifyGoogleIdToken(idToken, clientId);
+  } catch (err) {
+    throw new HttpError(401, err instanceof Error ? err.message : "Invalid ID token");
+  }
+  const db = c.env.DB;
+  const wallet = await db
+    .prepare("SELECT * FROM ap_wallets WHERE token_hash = ? AND status = 'active'")
+    .bind(await sha256Hex(walletToken))
+    .first<WalletRow>();
+  if (!wallet) throw new HttpError(401, "Unknown or revoked wallet token");
+  const t = nowIso();
+  await db
+    .prepare(
+      `INSERT INTO ap_users (google_sub, email, name, wallet_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name,
+         wallet_id = excluded.wallet_id, updated_at = excluded.updated_at`,
+    )
+    .bind(identity.sub, identity.email, identity.name, wallet.id, t, t)
+    .run();
+  return c.json({ ok: true, walletId: wallet.id });
 });
 
 /** One-page agent starter: wallet → key → bounty account → fund → spend. */

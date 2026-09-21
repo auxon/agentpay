@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -13,6 +13,51 @@ import {
 
 const TOKEN_KEY = "agentpay_token";
 
+/** GIS ID-token callback payload and our /auth/google response shape. */
+interface GoogleCredentialResponse {
+  credential: string;
+}
+
+interface GoogleSignInResult {
+  token: string;
+  walletId: string;
+  name: string;
+  email: string;
+  isNew: boolean;
+  recoveryCode: string | null;
+}
+
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (opts: { client_id: string; callback: (resp: GoogleCredentialResponse) => void }) => void;
+          renderButton: (el: HTMLElement, opts: Record<string, unknown>) => void;
+          disableAutoSelect: () => void;
+        };
+      };
+    };
+  }
+}
+
+/** Lazy-load the Google Identity Services script (only when login is configured). */
+let gsiPromise: Promise<void> | null = null;
+function loadGsi(): Promise<void> {
+  if (typeof window !== "undefined" && window.google?.accounts?.id) return Promise.resolve();
+  if (gsiPromise) return gsiPromise;
+  gsiPromise = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Google sign-in"));
+    document.head.appendChild(script);
+  });
+  return gsiPromise;
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY));
   const [data, setData] = useState<WalletResponse | null>(null);
@@ -23,13 +68,24 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [highlightApproval, setHighlightApproval] = useState("");
+  // Google sign-in state. The ID token lives in component state only — never
+  // in localStorage — and is kept solely to power "link an existing wallet".
+  const [googleIdentity, setGoogleIdentity] = useState<{ name: string; email: string } | null>(null);
+  const [googleIdToken, setGoogleIdToken] = useState<string | null>(null);
 
   const signOut = useCallback(() => {
     localStorage.removeItem(TOKEN_KEY);
     setToken(null);
     setData(null);
+    setGoogleIdentity(null);
+    setGoogleIdToken(null);
     setNotice("");
     setError("");
+    try {
+      window.google?.accounts.id.disableAutoSelect();
+    } catch {
+      // GIS is optional — sign-out must work without it.
+    }
   }, []);
 
   const refresh = useCallback(
@@ -177,6 +233,12 @@ export default function App() {
         </div>
         {data && (
           <div className="topRight">
+            {googleIdentity && (
+              <div className="balance">
+                <span className="balanceLabel">Signed in</span>
+                <span className="balanceValue">{googleIdentity.name}</span>
+              </div>
+            )}
             <div className="balance">
               <span className="balanceLabel">Balance</span>
               <span className="balanceValue">{formatCents(data.wallet.balanceCents)}</span>
@@ -209,7 +271,22 @@ export default function App() {
         </div>
       )}
 
-      {!token && <CreateWallet onCreated={(tok) => { localStorage.setItem(TOKEN_KEY, tok); setToken(tok); }} />}
+      {!token && (
+        <CreateWallet
+          onCreated={(tok) => {
+            localStorage.setItem(TOKEN_KEY, tok);
+            setToken(tok);
+          }}
+          onGoogleIdentity={(res, idToken) => {
+            setGoogleIdentity({ name: res.name, email: res.email });
+            setGoogleIdToken(idToken);
+          }}
+        />
+      )}
+
+      {token && googleIdToken && (
+        <LinkWallet idToken={googleIdToken} onLinked={() => void refresh()} />
+      )}
 
       {token && data && (
         <>
@@ -395,7 +472,129 @@ function QuickStartCard({
   );
 }
 
-function CreateWallet({ onCreated }: { onCreated: (token: string) => void }) {
+/** GIS "Sign in with Google" button. Renders only when /auth/google/config says configured. */
+function GoogleSignInButton({ onSignedIn }: { onSignedIn: (res: GoogleSignInResult, idToken: string) => void }) {
+  const [configured, setConfigured] = useState(false);
+  const [error, setError] = useState("");
+  const btnRef = useRef<HTMLDivElement>(null);
+  const onSignedInRef = useRef(onSignedIn);
+  onSignedInRef.current = onSignedIn;
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const cfg = await api<{ configured: boolean; clientId: string | null }>("/auth/google/config").catch(
+        () => null,
+      );
+      if (!cfg?.configured || !cfg.clientId || cancelled) return;
+      try {
+        await loadGsi();
+      } catch (err) {
+        if (!cancelled) setError(message(err));
+        return;
+      }
+      if (cancelled || !window.google) return;
+      window.google.accounts.id.initialize({
+        client_id: cfg.clientId,
+        callback: (resp: GoogleCredentialResponse) => {
+          void (async () => {
+            setError("");
+            try {
+              const res = await api<GoogleSignInResult>("/auth/google", {
+                method: "POST",
+                body: { idToken: resp.credential },
+              });
+              onSignedInRef.current(res, resp.credential);
+            } catch (err) {
+              setError(message(err));
+            }
+          })();
+        },
+      });
+      setConfigured(true);
+      if (btnRef.current) {
+        window.google.accounts.id.renderButton(btnRef.current, {
+          theme: "outline",
+          size: "large",
+          text: "signin_with",
+          width: 280,
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (!configured && !error) return null;
+  return (
+    <div>
+      {configured && <div ref={btnRef} />}
+      {error && <div className="banner bad">{error}</div>}
+    </div>
+  );
+}
+
+/** Attach a wallet created the old way (token) to the signed-in Google identity. */
+function LinkWallet({ idToken, onLinked }: { idToken: string; onLinked: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [walletToken, setWalletToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api<{ ok: boolean; walletId: string }>("/auth/google/link", {
+        method: "POST",
+        body: { idToken, walletToken: walletToken.trim() },
+      });
+      setWalletToken("");
+      setOpen(false);
+      onLinked();
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="card">
+      <button className="ghost" type="button" onClick={() => setOpen(!open)}>
+        {open ? "Cancel linking" : "Already have a wallet? Link it to this Google account"}
+      </button>
+      {open && (
+        <form className="form" onSubmit={submit}>
+          <label>
+            Wallet token (apw_…)
+            <input
+              value={walletToken}
+              onChange={(e) => setWalletToken(e.target.value)}
+              placeholder="apw_…"
+              required
+            />
+          </label>
+          {error && <div className="banner bad">{error}</div>}
+          <button className="primary" disabled={busy} type="submit">
+            {busy ? "Linking…" : "Link wallet"}
+          </button>
+          <p className="fine">Links the wallet to your Google identity — no data moves.</p>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function CreateWallet({
+  onCreated,
+  onGoogleIdentity,
+}: {
+  onCreated: (token: string) => void;
+  onGoogleIdentity: (res: GoogleSignInResult, idToken: string) => void;
+}) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -492,6 +691,17 @@ function CreateWallet({ onCreated }: { onCreated: (token: string) => void }) {
       <button className="ghost" type="button" onClick={() => setShowRecover(!showRecover)}>
         {showRecover ? "Cancel recovery" : "Recover an existing wallet"}
       </button>
+
+      <p className="fine">— or —</p>
+      <GoogleSignInButton
+        onSignedIn={(res, idToken) => {
+          // Record the identity + ID token first (never in localStorage);
+          // new wallets show the one-time recovery screen before proceeding.
+          onGoogleIdentity(res, idToken);
+          if (res.isNew && res.recoveryCode) setCreated({ token: res.token, recoveryCode: res.recoveryCode });
+          else onCreated(res.token);
+        }}
+      />
 
       {showRecover && (
         <form className="form" onSubmit={recover}>

@@ -271,3 +271,15 @@ CREATE TABLE IF NOT EXISTS ap_trial_claims (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (ip_hash, day)
 );
+
+-- Google sign-in: maps a Google identity (sub) to a wallet. Raw ID tokens
+-- are never stored — only sub, email and name.
+CREATE TABLE IF NOT EXISTS ap_users (
+  google_sub TEXT PRIMARY KEY,
+  email TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  wallet_id TEXT NOT NULL REFERENCES ap_wallets(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ap_users_wallet ON ap_users(wallet_id);

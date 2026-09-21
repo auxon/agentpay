@@ -246,6 +246,15 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 | `POST /agent/bounties/:id/settle` · `…/retry` | `agp_` | Poster decides (paid/refunded); or retry a blocked payout |
 | `POST /internal/bounty-event` | shared secret | BSVBounties settle callback (payout trigger/credit) |
 | `POST /webhooks/stripe` | Stripe sig | Idempotent top-up fulfillment |
+| `GET /auth/google/config` | — | Whether Google login is configured (+ client ID) |
+| `POST /auth/google` | Google ID token | Sign in: new identity mints a wallet; returning identity gets a fresh token |
+| `POST /auth/google/link` | Google ID token + `apw_` | Attach a token-created wallet to a Google identity |
+
+## Google sign-in
+
+Dashboard sign-in with Google (GIS ID-token flow — no client secret, no
+redirect): see [docs/GOOGLE-LOGIN.md](docs/GOOGLE-LOGIN.md) for Cloud Console
+setup, `GOOGLE_CLIENT_ID` configuration, schema migration, and security notes.
 
 ## MCP tools
 
