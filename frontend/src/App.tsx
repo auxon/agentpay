@@ -480,6 +480,13 @@ function GoogleSignInButton({ onSignedIn }: { onSignedIn: (res: GoogleSignInResu
   const onSignedInRef = useRef(onSignedIn);
   onSignedInRef.current = onSignedIn;
 
+  // NOTE (2026-09-28): the button used to never render. The old code called
+  // setConfigured(true) and then, in the same tick, renderButton(btnRef)
+  // — but the div only mounts on the re-render that setConfigured triggers,
+  // so btnRef.current was always null and the guarded render was skipped
+  // silently, for everyone, in every browser. The button below renders in a
+  // separate effect that runs after the div mounts; initialize failures now
+  // surface instead of dying quiet.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -493,38 +500,55 @@ function GoogleSignInButton({ onSignedIn }: { onSignedIn: (res: GoogleSignInResu
         if (!cancelled) setError(message(err));
         return;
       }
-      if (cancelled || !window.google) return;
-      window.google.accounts.id.initialize({
-        client_id: cfg.clientId,
-        callback: (resp: GoogleCredentialResponse) => {
-          void (async () => {
-            setError("");
-            try {
-              const res = await api<GoogleSignInResult>("/auth/google", {
-                method: "POST",
-                body: { idToken: resp.credential },
-              });
-              onSignedInRef.current(res, resp.credential);
-            } catch (err) {
-              setError(message(err));
-            }
-          })();
-        },
-      });
-      setConfigured(true);
-      if (btnRef.current) {
-        window.google.accounts.id.renderButton(btnRef.current, {
-          theme: "outline",
-          size: "large",
-          text: "signin_with",
-          width: 280,
-        });
+      if (cancelled || !window.google?.accounts?.id) {
+        if (!cancelled) setError("Google sign-in failed to start");
+        return;
       }
+      try {
+        window.google.accounts.id.initialize({
+          client_id: cfg.clientId,
+          callback: (resp: GoogleCredentialResponse) => {
+            void (async () => {
+              setError("");
+              try {
+                const res = await api<GoogleSignInResult>("/auth/google", {
+                  method: "POST",
+                  body: { idToken: resp.credential },
+                });
+                onSignedInRef.current(res, resp.credential);
+              } catch (err) {
+                setError(message(err));
+              }
+            })();
+          },
+        });
+      } catch (err) {
+        if (!cancelled) setError(message(err));
+        return;
+      }
+      if (!cancelled) setConfigured(true);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Runs after the div above mounts, so the ref is set. Guards against
+  // double-render (StrictMode remounts) by rendering only into an empty div.
+  useEffect(() => {
+    if (!configured || !btnRef.current || !window.google?.accounts?.id) return;
+    if (btnRef.current.childElementCount > 0) return;
+    try {
+      window.google.accounts.id.renderButton(btnRef.current, {
+        theme: "outline",
+        size: "large",
+        text: "signin_with",
+        width: 280,
+      });
+    } catch (err) {
+      setError(message(err));
+    }
+  }, [configured]);
 
   if (!configured && !error) return null;
   return (
