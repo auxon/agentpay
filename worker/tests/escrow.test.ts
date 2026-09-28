@@ -204,6 +204,62 @@ describe("processEscrowEvent", () => {
     expect(balance?.balance_cents).toBe(200); // 100 charge + 100 refund
   });
 
+  it("pushes a bounty_paid observation to Trust on settle (best-effort)", async () => {
+    const env = testEnv({ TRUST_URL: "https://trust.test", TRUST_INGEST_SECRET: "s3cret" });
+    const { db, worker } = await makeEscrowFixture(env, 100);
+    // The claim carried a bare worker key: the push must attribute to it.
+    await db
+      .prepare("UPDATE ap_bounty_links SET worker_pubkey = ? WHERE bounty_id = ?")
+      .bind("03".repeat(33), "b1")
+      .run();
+    const pushed: Array<{ url: string; body: unknown }> = [];
+    const calls = mockNetwork();
+    const origFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.startsWith("https://trust.test/")) {
+          pushed.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
+          return Response.json({ observations: 1 });
+        }
+        return (origFetch as typeof fetch)(input, init);
+      },
+    );
+    try {
+      const result = await processEscrowEvent(db, env, {
+        bountyId: "b1",
+        outcome: "paid",
+        funding: "agentpay",
+      });
+      expect(result.credited).toBe(true);
+      expect(pushed.length).toBe(1);
+      const obs = (pushed[0].body as { observations: Array<Record<string, unknown>> }).observations[0];
+      expect(obs.subject).toBe(`key:${"03".repeat(33)}`);
+      expect(obs.kind).toBe("bounty_paid");
+      expect(obs.ref).toBe("b1");
+      expect(obs.source).toBe("agentpay");
+      expect((await getEscrowRow(db, "b1"))?.status).toBe("paid");
+      void worker;
+      void calls;
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("skips the Trust push when unconfigured and never blocks money", async () => {
+    const env = testEnv(); // no TRUST_INGEST_SECRET
+    const { db } = await makeEscrowFixture(env, 100);
+    mockNetwork();
+    const result = await processEscrowEvent(db, env, {
+      bountyId: "b1",
+      outcome: "paid",
+      funding: "agentpay",
+    });
+    expect(result.credited).toBe(true);
+    expect((await getEscrowRow(db, "b1"))?.status).toBe("paid");
+  });
+
   it("is idempotent on replay", async () => {
     const env = testEnv();
     const { db, worker } = await makeEscrowFixture(env, 100);

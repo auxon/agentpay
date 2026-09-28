@@ -98,6 +98,10 @@ export interface AppEnv {
   BOUNTIES_API_URL?: string;
   /** Shared secret bsv-bounties sends on settle events (x-agentpay-internal). */
   BOUNTIES_WEBHOOK_SECRET?: string;
+  /** Trust worker base URL for settled-work observations (default https://entangleit.com/trust). */
+  TRUST_URL?: string;
+  /** Shared secret Trust accepts on POST /v1/ingest (x-trust-internal). Unset = no push. */
+  TRUST_INGEST_SECRET?: string;
   /** Sats per USD cent when crediting bounty payouts (default 40000 = $25/BSV). */
   BOUNTY_SATS_PER_CENT?: string;
   /** AES-256-GCM key (base64, 32 bytes) encrypting per-bounty escrow WIFs. */

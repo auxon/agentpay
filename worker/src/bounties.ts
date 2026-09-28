@@ -36,6 +36,70 @@ import { PrivateKey } from "@bsv/sdk";
 export const BOUNTIES_FALLBACK_URL = "https://bsv-bounties.richard-hein.workers.dev";
 export const BOUNTIES_API_PREFIX = "/bsvbounties/v1";
 
+/** Trust worker base URL for settled-work observations. */
+export const TRUST_DEFAULT_URL = "https://entangleit.com/trust";
+
+/**
+ * Trust subject for a settled bounty worker: the bounties account when the
+ * claim carried one (it is the reputation subject), else the worker's bare
+ * key, else the worker's agentpay wallet (whose spend snapshots already
+ * land there). Returns null when nothing identifies the worker — the push
+ * is skipped rather than attributed to the wrong subject.
+ */
+export function trustSubjectForWorker(link: {
+  worker_account?: number | null;
+  worker_pubkey?: string | null;
+  wallet_id?: string;
+}): string | null {
+  if (typeof link.worker_account === "number" && Number.isFinite(link.worker_account) && link.worker_account > 0) {
+    return `account:${Math.floor(link.worker_account)}`;
+  }
+  const pub = (link.worker_pubkey ?? "").trim();
+  if (pub && !pub.includes(":") && /^[A-Za-z0-9:_.@-]{1,160}$/.test(pub)) {
+    return `key:${pub}`;
+  }
+  if (link.wallet_id) return `wallet:${link.wallet_id}`;
+  return null;
+}
+
+/**
+ * Push a settled-work observation to the Trust worker so paid bounties move
+ * profiles without waiting for the 15-minute reconcile. Best-effort by
+ * design: skipped when unconfigured, and a failure never touches money —
+ * the payout above already landed. Returns true when Trust stored it.
+ */
+export async function pushTrustBountyPaid(
+  env: AppEnv,
+  input: { subject: string; bountyId: string; amountSats: number; txid: string },
+): Promise<boolean> {
+  const secret = (env.TRUST_INGEST_SECRET ?? "").trim();
+  if (!secret) return false;
+  const base = (env.TRUST_URL ?? TRUST_DEFAULT_URL).replace(/\/$/, "");
+  try {
+    const res = await fetch(`${base}/v1/ingest`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-trust-internal": secret },
+      body: JSON.stringify({
+        observations: [
+          {
+            subject: input.subject,
+            source: "agentpay",
+            kind: "bounty_paid",
+            ref: input.bountyId,
+            value: input.amountSats,
+            meta: { txid: input.txid, amountSats: input.amountSats },
+          },
+        ],
+      }),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json().catch(() => null)) as { observations?: unknown } | null;
+    return typeof body?.observations === "number" && body.observations > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** $25/BSV default, matching bsv-bounties' BSV_USD var. */
 export const DEFAULT_SATS_PER_CENT = 40_000;
 
@@ -803,6 +867,23 @@ export async function processEscrowEvent(
       `/internal/agentpay/bounties/${encodeURIComponent(event.bountyId)}/txid`,
       { method: "PATCH", body: JSON.stringify({ txid, status: "paid" }) },
     ).catch(() => {});
+    // Settled work moves Trust profiles: push the fact now instead of
+    // waiting for reconcile. Never throws — the payout above already landed.
+    if (link) {
+      const subject = trustSubjectForWorker({
+        worker_account: link.worker_account,
+        worker_pubkey: link.worker_pubkey,
+        wallet_id: link.wallet_id,
+      });
+      if (subject) {
+        await pushTrustBountyPaid(env, {
+          subject,
+          bountyId: event.bountyId,
+          amountSats: row.amount_sats,
+          txid,
+        }).catch(() => false);
+      }
+    }
     return { ok: true, credited: !direct && Boolean(link), amountCents: creditedCents };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

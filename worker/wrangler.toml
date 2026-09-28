@@ -67,3 +67,9 @@ TRIAL_ENABLED = "1"
 #   ADMIN_SECRET            ops endpoints (x-admin-secret)
 #   BOUNTIES_WEBHOOK_SECRET shared secret bsv-bounties sends on settle events
 #                           (x-agentpay-internal). Same value in both workers.
+#   TRUST_INGEST_SECRET     shared secret the Trust worker accepts on
+#                           POST /v1/ingest (x-trust-internal). Same value as
+#                           Trust's TRUST_INGEST_SECRET. Unset = agentpay
+#                           settles without pushing observations.
+#   TRUST_URL               Trust worker base URL (default
+#                           https://entangleit.com/trust).
