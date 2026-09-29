@@ -64,7 +64,7 @@ export default function App() {
   const [services, setServices] = useState<ServicesResponse | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [tab, setTab] = useState<"wallet" | "agents" | "services">("wallet");
+  const [tab, setTab] = useState<"wallet" | "agents" | "services" | "market">("wallet");
   const [loading, setLoading] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [highlightApproval, setHighlightApproval] = useState("");
@@ -300,6 +300,9 @@ export default function App() {
             <button className={tab === "services" ? "tab active" : "tab"} onClick={() => setTab("services")}>
               Services
             </button>
+            <button className={tab === "market" ? "tab active" : "tab"} onClick={() => setTab("market")}>
+              Market
+            </button>
           </nav>
 
           {tab === "wallet" && (
@@ -362,6 +365,8 @@ export default function App() {
           {tab === "services" && (
             <ServicesPanel data={services} onReload={() => void loadServices()} />
           )}
+
+          {tab === "market" && <MarketPanel walletId={data.wallet.id} />}
         </>
       )}
 
@@ -1886,6 +1891,238 @@ function LedgerTable({
       </tbody>
       </table>
     </>
+  );
+}
+
+const MARKET_KEY = "agentpay_market_key";
+
+interface MarketOrderPublic {
+  id: string;
+  title: string;
+  description: string;
+  price_sats: number;
+  fulfillment: string;
+  status: string;
+  escrow_address: string | null;
+}
+
+/** P2P trade with on-chain escrow. Actions need an agent key (buyer or seller side). */
+function MarketPanel({ walletId }: { walletId: string }) {
+  const [agentKey, setAgentKey] = useState(() => localStorage.getItem(MARKET_KEY) ?? "");
+  const [open, setOpen] = useState<MarketOrderPublic[]>([]);
+  const [mine, setMine] = useState<Array<Record<string, unknown>>>([]);
+  const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [form, setForm] = useState({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: "", buyerWalletId: "" });
+  const [deliver, setDeliver] = useState({ hash: "", carrier: "", tracking: "", note: "" });
+  const [disputeReason, setDisputeReason] = useState("");
+  const [evidence, setEvidence] = useState("");
+
+  // Agent routes need an agp_ agent key as the bearer value (api() sends
+  // its `token` param as Authorization: Bearer).
+  const authed = async <T,>(path: string, body?: unknown): Promise<T> => {
+    if (!agentKey.trim()) throw new Error("Paste an agent key below first (mint one under Agents).");
+    return api<T>(path, { method: body === undefined ? "GET" : "POST", body, token: agentKey.trim() });
+  };
+  const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
+
+  const reload = async () => {
+    setError("");
+    try {
+      const [o, m] = await Promise.all([
+        api<{ orders: MarketOrderPublic[] }>("/market/orders"),
+        agentKey.trim()
+          ? api<{ orders: Array<Record<string, unknown>> }>("/agent/market/orders", { token: agentKey.trim() }).catch(() => ({ orders: [] }))
+          : Promise.resolve({ orders: [] }),
+      ]);
+      setOpen(o.orders ?? []);
+      setMine(m.orders ?? []);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveKey = (v: string) => {
+    setAgentKey(v);
+    if (v.trim()) localStorage.setItem(MARKET_KEY, v.trim());
+    else localStorage.removeItem(MARKET_KEY);
+  };
+
+  const roleOf = (o: Record<string, unknown>): string => {
+    if (o.seller_wallet_id === walletId) return "seller";
+    if (o.buyer_wallet_id === walletId) return "buyer";
+    return "";
+  };
+
+  const openDetail = async (id: string) => {
+    setError("");
+    setNotice("");
+    try {
+      const r = await api<{ order: Record<string, unknown> }>(`/market/orders/${encodeURIComponent(id)}`);
+      setDetail(r.order);
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const create = async () => {
+    setError("");
+    setNotice("");
+    try {
+      const r = await authed<{ order: Record<string, unknown>; escrowAddress: string }>("/agent/market/orders", {
+        title: form.title,
+        description: form.description,
+        priceSats: Number(form.priceSats),
+        fulfillment: form.fulfillment,
+        contentHash: form.contentHash || undefined,
+        payoutAddress: form.payoutAddress,
+        buyerWalletId: form.buyerWalletId || undefined,
+      });
+      setNotice(`Listed. Buyer funds this escrow address: ${r.escrowAddress}`);
+      setForm({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: "", buyerWalletId: "" });
+      await reload();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const act = async (id: string, path: string, body?: unknown, okMsg?: string) => {
+    setError("");
+    try {
+      await authed(`/agent/market/orders/${encodeURIComponent(id)}${path}`, body ?? {});
+      if (okMsg) setNotice(okMsg);
+      await openDetail(id);
+      await reload();
+    } catch (e) {
+      fail(e);
+    }
+  };
+
+  const d = detail as (Record<string, unknown> & { id: string; status: string }) | null;
+  const myRow = d ? mine.find((o) => o.id === d.id) : undefined;
+  const myRole = myRow ? roleOf(myRow) : "";
+
+  return (
+    <section className="card">
+      <h2>Marketplace</h2>
+      <p className="muted">
+        Fixed-price P2P trade with on-chain escrow. Sellers list, buyers fund the escrow address directly,
+        sellers deliver, buyers approve — disputes go to Jev-advised arbitration. 2% platform fee on release.
+      </p>
+      <label>
+        Agent key (buyer or seller side)
+        <input value={agentKey} onChange={(e) => saveKey(e.target.value)} placeholder="agp_…" />
+      </label>
+      {error && <div className="banner bad">{error}</div>}
+      {notice && <div className="banner">{notice}</div>}
+
+      <h3>Sell something</h3>
+      <label>Title<input value={form.title} maxLength={120} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="What are you selling?" /></label>
+      <label>Description<textarea value={form.description} maxLength={2000} rows={3} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Exactly what the buyer gets" /></label>
+      <div className="row">
+        <label>Price (sats)<input type="number" min={1} value={form.priceSats} onChange={(e) => setForm({ ...form, priceSats: e.target.value })} /></label>
+        <label>Fulfillment
+          <select value={form.fulfillment} onChange={(e) => setForm({ ...form, fulfillment: e.target.value })}>
+            <option value="digital">digital</option>
+            <option value="physical">physical</option>
+          </select>
+        </label>
+      </div>
+      <label>Content sha256 (digital, optional — enables exact-match delivery)<input value={form.contentHash} onChange={(e) => setForm({ ...form, contentHash: e.target.value })} placeholder="64 hex" /></label>
+      <label>Your payout address<input value={form.payoutAddress} onChange={(e) => setForm({ ...form, payoutAddress: e.target.value })} placeholder="BSV P2PKH address" /></label>
+      <label>Private buyer wallet id (optional — OTC listing)<input value={form.buyerWalletId} onChange={(e) => setForm({ ...form, buyerWalletId: e.target.value })} placeholder="apw_…" /></label>
+      <div className="row"><button className="primary" onClick={() => void create()}>List item</button></div>
+
+      <h3>Open orders</h3>
+      {open.length === 0 && <p className="muted">Nothing listed right now.</p>}
+      {open.map((o) => (
+        <div key={o.id} className="service">
+          <div className="serviceHead">
+            <strong>{o.title}</strong>
+            <span className="muted">{o.price_sats.toLocaleString()} sats · {o.fulfillment}</span>
+          </div>
+          <p>{o.description}</p>
+          <div className="row"><button className="ghost" onClick={() => void openDetail(o.id)}>Open</button></div>
+        </div>
+      ))}
+
+      <h3>My orders</h3>
+      {mine.length === 0 && <p className="muted">None yet — orders you sell or fund appear here.</p>}
+      {mine.map((o) => (
+        <div key={String(o.id)} className="service">
+          <div className="serviceHead">
+            <strong>{String(o.title)}</strong>
+            <span className="muted">{String(o.status)} · {roleOf(o)}</span>
+          </div>
+          <div className="row"><button className="ghost" onClick={() => void openDetail(String(o.id))}>Open</button></div>
+        </div>
+      ))}
+
+      {d && (
+        <div className="service">
+          <div className="serviceHead">
+            <strong>{String(d.title ?? d.id)}</strong>
+            <span className="muted">{String(d.status)}{myRole ? ` · you are ${myRole}` : ""}</span>
+          </div>
+          <p>{String(d.description ?? "")}</p>
+          {typeof d.escrow_address === "string" && d.escrow_address && (
+            <p className="muted">Escrow: <code>{d.escrow_address}</code></p>
+          )}
+          {typeof d.tracking === "string" && d.tracking && (
+            <p>Tracking: <code>{d.tracking}</code>{typeof d.carrier === "string" && d.carrier ? ` via ${d.carrier}` : ""}</p>
+          )}
+          {typeof d.dispute_reason === "string" && d.dispute_reason && <p>Dispute: {d.dispute_reason}</p>}
+          {Array.isArray(d.evidence) && d.evidence.length > 0 && (
+            <ul className="tools">
+              {(d.evidence as Array<Record<string, unknown>>).map((e, i) => (
+                <li key={i}><strong>{String(e.side)}:</strong> {String(e.text)}</li>
+              ))}
+            </ul>
+          )}
+          {myRole === "buyer" && d.status === "open" && (
+            <p className="muted">Fund the escrow address above, then press check funding.</p>
+          )}
+          <div className="row">
+            <button className="ghost" onClick={() => void act(String(d.id), "/fund-check", {})}>Check funding</button>
+            {myRole === "seller" && d.status === "funded" && (
+              <>
+                <button className="ghost" onClick={() => {
+                  const kind = deliver.hash.trim() ? "hash" : deliver.tracking.trim() ? "tracking" : "other";
+                  return void act(String(d.id), "/deliver", {
+                    kind, hash: deliver.hash || undefined, carrier: deliver.carrier || undefined,
+                    tracking: deliver.tracking || undefined, note: deliver.note || undefined,
+                  }, "Delivered.");
+                }}>Deliver</button>
+                <input value={deliver.hash} onChange={(e) => setDeliver({ ...deliver, hash: e.target.value })} placeholder="sha256 (digital)" />
+                <input value={deliver.tracking} onChange={(e) => setDeliver({ ...deliver, tracking: e.target.value })} placeholder="tracking # (physical)" />
+              </>
+            )}
+            {myRole === "buyer" && d.status === "delivered" && (
+              <>
+                <button className="primary" onClick={() => void act(String(d.id), "/approve", {}, "Released to seller.")}>Approve &amp; release</button>
+                <input value={disputeReason} onChange={(e) => setDisputeReason(e.target.value)} placeholder="Dispute reason (min 20 chars)" />
+                <button className="ghost" onClick={() => void act(String(d.id), "/dispute", { reason: disputeReason }, "Disputed.")}>Dispute</button>
+              </>
+            )}
+            {(myRole === "seller" || myRole === "buyer") && d.status === "disputed" && (
+              <>
+                <input value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder="Evidence text" />
+                <button className="ghost" onClick={() => void act(String(d.id), "/evidence", { text: evidence }, "Evidence added.")}>Add evidence</button>
+              </>
+            )}
+            {myRole === "seller" && d.status === "open" && (
+              <button className="ghost" onClick={() => void act(String(d.id), "/cancel", {}, "Cancelled.")}>Cancel listing</button>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 

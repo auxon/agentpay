@@ -283,3 +283,37 @@ CREATE TABLE IF NOT EXISTS ap_users (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ap_users_wallet ON ap_users(wallet_id);
+
+-- Marketplace: P2P trade with on-chain escrow + advised arbitration.
+-- Money movement reuses ap_bounty_escrows (post_ref `market-order:<id>`).
+CREATE TABLE IF NOT EXISTS ap_market_orders (
+  id TEXT PRIMARY KEY,
+  seller_wallet_id TEXT NOT NULL,
+  seller_agent_id TEXT,
+  buyer_wallet_id TEXT,
+  buyer_agent_id TEXT,
+  buyer_refund_address TEXT,
+  buyer_allow_wallet_id TEXT,
+  title TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  price_sats INTEGER NOT NULL DEFAULT 0,
+  fee_bps INTEGER NOT NULL DEFAULT 200,
+  fulfillment TEXT NOT NULL DEFAULT 'digital',
+  content_hash TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  escrow_id TEXT,
+  funding_txid TEXT,
+  delivery_json TEXT,
+  dispute_reason TEXT,
+  dispute_at TEXT,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  resolution_json TEXT,
+  payout_txid TEXT,
+  refund_txid TEXT,
+  delivered_at TEXT,
+  expires_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_market_orders_status ON ap_market_orders(status);
+CREATE INDEX IF NOT EXISTS idx_market_orders_seller ON ap_market_orders(seller_wallet_id);

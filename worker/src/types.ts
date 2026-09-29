@@ -96,6 +96,10 @@ export interface AppEnv {
   BOUNTIES?: Fetcher;
   /** Base URL used when the BOUNTIES binding is absent (workers.dev fallback). */
   BOUNTIES_API_URL?: string;
+  /** Decision-oracle base URL for dispute arbitration (default https://entangleit.com/oracle). */
+  ORACLE_URL?: string;
+  /** Buyer approval window for marketplace orders, in days (default 7). */
+  MARKET_APPROVAL_DAYS?: string;
   /** Shared secret bsv-bounties sends on settle events (x-agentpay-internal). */
   BOUNTIES_WEBHOOK_SECRET?: string;
   /** Trust worker base URL for settled-work observations (default https://entangleit.com/trust). */

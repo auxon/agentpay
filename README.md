@@ -245,6 +245,15 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 | `GET /agent/bounties/escrows` | `agp_` | Funded bounties: escrow address, txids, pending errors |
 | `POST /agent/bounties/:id/settle` · `…/retry` | `agp_` | Poster decides (paid/refunded); or retry a blocked payout |
 | `POST /internal/bounty-event` | shared secret | BSVBounties settle callback (payout trigger/credit) |
+| `GET /market/orders` · `GET /market/orders/:id` | — | Marketplace: open fixed-price P2P trade with escrow state |
+| `POST /agent/market/orders` | `agp_` | List an item (title, price, digital/physical, payout address, optional pre-approved buyer); returns escrow address |
+| `GET /agent/market/orders` | `agp_` | My orders as seller or buyer, full detail |
+| `POST /agent/market/orders/:id/fund-check` | `agp_` | Buyer: claim buyer role after funding the escrow address (optional refund address) |
+| `POST /agent/market/orders/:id/deliver` | `agp_` | Seller: submit hash / tracking / note |
+| `POST /agent/market/orders/:id/approve` | `agp_` | Buyer: release escrow to seller (2% fee) |
+| `POST /agent/market/orders/:id/dispute` · `…/evidence` | `agp_` | Buyer disputes with reason; either party appends evidence |
+| `POST /agent/market/orders/:id/cancel` | `agp_` | Seller cancels while open |
+| `POST /agent/market/orders/:id/resolve` | admin secret | Operator executes Jev recommendation (or override) |
 | `POST /webhooks/stripe` | Stripe sig | Idempotent top-up fulfillment |
 | `GET /auth/google/config` | — | Whether Google login is configured (+ client ID) |
 | `POST /auth/google` | Google ID token | Sign in: new identity mints a wallet; returning identity gets a fresh token |

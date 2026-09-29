@@ -1789,6 +1789,134 @@ api.get("/agent/bounties", async (c) => {
   return c.json({ bounties: links });
 });
 
+// ---------- Marketplace: P2P trade with on-chain escrow ----------
+//
+// Sellers list digital goods or physical items; buyers fund escrow directly;
+// sellers deliver; buyers approve. Disputes get a Jev recommendation with
+// operator execution. Delivery/tracking content never touches agent keys.
+
+api.get("/market/orders", async (c) => {
+  const { listOpenOrders, publicOrder } = await import("./market");
+  const limit = Number(c.req.query("limit") ?? 25);
+  const rows = await listOpenOrders(c.env.DB, Number.isFinite(limit) ? limit : 25);
+  const out = [];
+  for (const r of rows) out.push(await publicOrder(c.env.DB, r));
+  return c.json({ orders: out });
+});
+
+api.get("/market/orders/:id", async (c) => {
+  const { getOrder, publicOrder, settleDueOrders } = await import("./market");
+  const order = await getOrder(c.env.DB, c.req.param("id"));
+  if (!order) throw new HttpError(404, "Order not found");
+  await settleDueOrders(c.env.DB, c.env).catch(() => {});
+  const fresh = (await getOrder(c.env.DB, c.req.param("id")))!;
+  return c.json({ order: await publicOrder(c.env.DB, fresh) });
+});
+
+api.post("/agent/market/orders", async (c) => {
+  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { createOrder } = await import("./market");
+  const { order, escrowAddress } = await createOrder(
+    c.env.DB,
+    c.env,
+    { walletId: wallet.id, agentId: agent.id },
+    {
+      title: body.title,
+      description: body.description,
+      priceSats: body.priceSats,
+      fulfillment: body.fulfillment,
+      contentHash: body.contentHash,
+      payoutAddress: body.payoutAddress,
+      buyerWalletId: body.buyerWalletId,
+    },
+  );
+  return c.json({ order, escrowAddress }, 201);
+});
+
+api.get("/agent/market/orders", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { getOrder } = await import("./market");
+  const rows = await c.env.DB.prepare(
+    "SELECT id FROM ap_market_orders WHERE seller_wallet_id = ? OR buyer_wallet_id = ? ORDER BY created_at DESC LIMIT 50",
+  ).bind(wallet.id, wallet.id).all<{ id: string }>();
+  const orders = [];
+  for (const r of rows.results ?? []) {
+    const order = await getOrder(c.env.DB, r.id);
+    if (order) orders.push(order);
+  }
+  return c.json({ orders });
+});
+
+api.post("/agent/market/orders/:id/fund-check", async (c) => {
+  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { checkFunding } = await import("./market");
+  const result = await checkFunding(c.env.DB, c.env, c.req.param("id"), { walletId: wallet.id, agentId: agent.id }, {
+    refundAddress: typeof body.refundAddress === "string" ? body.refundAddress : undefined,
+  });
+  return c.json(result);
+});
+
+api.post("/agent/market/orders/:id/deliver", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { deliverOrder } = await import("./market");
+  const result = await deliverOrder(c.env.DB, c.env, wallet.id, c.req.param("id"), {
+    kind: body.kind,
+    hash: body.hash,
+    carrier: body.carrier,
+    tracking: body.tracking,
+    note: body.note,
+  });
+  return c.json(result);
+});
+
+api.post("/agent/market/orders/:id/approve", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { approveOrder } = await import("./market");
+  const result = await approveOrder(c.env.DB, c.env, c.req.param("id"), wallet.id);
+  return c.json(result);
+});
+
+api.post("/agent/market/orders/:id/dispute", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { disputeOrder } = await import("./market");
+  const result = await disputeOrder(c.env.DB, c.req.param("id"), wallet.id, body.reason);
+  return c.json(result, 201);
+});
+
+api.post("/agent/market/orders/:id/evidence", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const { disputeEvidence } = await import("./market");
+  const result = await disputeEvidence(c.env.DB, c.req.param("id"), wallet.id, {
+    text: body.text,
+    hashes: body.hashes,
+  });
+  return c.json(result, 201);
+});
+
+api.post("/agent/market/orders/:id/cancel", async (c) => {
+  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { cancelOrder } = await import("./market");
+  const result = await cancelOrder(c.env.DB, wallet.id, c.req.param("id"));
+  return c.json(result);
+});
+
+/** Operator resolves a dispute: Jev recommends, the operator executes. */
+api.post("/agent/market/orders/:id/resolve", async (c) => {
+  const secret = (c.env.ADMIN_SECRET ?? "").trim();
+  const provided = (c.req.header("x-admin-secret") ?? "").trim();
+  if (!secret || !provided || !timingSafeEqualStr(provided, secret)) throw new HttpError(403, "operator only");
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const override = body.override === "release" || body.override === "refund" ? body.override : undefined;
+  const { resolveOrder } = await import("./market");
+  const result = await resolveOrder(c.env.DB, c.env, c.req.param("id"), override ? { override } : {});
+  return c.json(result);
+});
+
 /** Settle callback from bsv-bounties (server-to-server, shared secret). */
 api.post("/internal/bounty-event", async (c) => {
   const secret = c.env.BOUNTIES_WEBHOOK_SECRET;

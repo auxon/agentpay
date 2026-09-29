@@ -70,11 +70,12 @@ export function trustSubjectForWorker(link: {
  */
 export async function pushTrustBountyPaid(
   env: AppEnv,
-  input: { subject: string; bountyId: string; amountSats: number; txid: string },
+  input: { subject: string; bountyId: string; amountSats: number; txid: string; kind?: "bounty_paid" | "dispute_lost" },
 ): Promise<boolean> {
   const secret = (env.TRUST_INGEST_SECRET ?? "").trim();
   if (!secret) return false;
   const base = (env.TRUST_URL ?? TRUST_DEFAULT_URL).replace(/\/$/, "");
+  const kind = input.kind ?? "bounty_paid";
   try {
     const res = await fetch(`${base}/v1/ingest`, {
       method: "POST",
@@ -84,7 +85,7 @@ export async function pushTrustBountyPaid(
           {
             subject: input.subject,
             source: "agentpay",
-            kind: "bounty_paid",
+            kind,
             ref: input.bountyId,
             value: input.amountSats,
             meta: { txid: input.txid, amountSats: input.amountSats },
