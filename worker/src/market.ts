@@ -88,6 +88,7 @@ export interface MarketOrderRow {
   content_hash: string | null;
   status: MarketStatus;
   escrow_id: string | null;
+  funding_txid: string | null;
   delivery_json: string | null;
   dispute_reason: string | null;
   dispute_at: string | null;
@@ -212,6 +213,9 @@ export interface PublicOrder {
   has_content_hash: boolean;
   status: MarketStatus;
   escrow_address: string | null;
+  funding_txid: string | null;
+  payout_txid: string | null;
+  refund_txid: string | null;
   delivery: Delivery | null;
   dispute_reason: string | null;
   evidence: EvidenceItem[];
@@ -258,6 +262,9 @@ export async function publicOrder(db: D1Database, order: MarketOrderRow): Promis
     has_content_hash: Boolean(order.content_hash),
     status: order.status,
     escrow_address: escrow?.escrow_address ?? null,
+    funding_txid: order.funding_txid,
+    payout_txid: order.payout_txid,
+    refund_txid: order.refund_txid,
     delivery: open ? delivery : null,
     dispute_reason: open ? order.dispute_reason : null,
     evidence: open ? evidence : [],

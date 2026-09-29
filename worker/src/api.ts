@@ -21,7 +21,7 @@ import {
   type SubagentRow,
   type WalletRow,
 } from "./types";
-import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
+import { requireAgent, requireAgentOrWallet, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
   agentSpendAllowed,
   agentToolAllowed,
@@ -1814,13 +1814,13 @@ api.get("/market/orders/:id", async (c) => {
 });
 
 api.post("/agent/market/orders", async (c) => {
-  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId, agentId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const { createOrder } = await import("./market");
   const { order, escrowAddress } = await createOrder(
     c.env.DB,
     c.env,
-    { walletId: wallet.id, agentId: agent.id },
+    { walletId, agentId },
     {
       title: body.title,
       description: body.description,
@@ -1835,11 +1835,11 @@ api.post("/agent/market/orders", async (c) => {
 });
 
 api.get("/agent/market/orders", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const { getOrder } = await import("./market");
   const rows = await c.env.DB.prepare(
     "SELECT id FROM ap_market_orders WHERE seller_wallet_id = ? OR buyer_wallet_id = ? ORDER BY created_at DESC LIMIT 50",
-  ).bind(wallet.id, wallet.id).all<{ id: string }>();
+  ).bind(walletId, walletId).all<{ id: string }>();
   const orders = [];
   for (const r of rows.results ?? []) {
     const order = await getOrder(c.env.DB, r.id);
@@ -1849,20 +1849,20 @@ api.get("/agent/market/orders", async (c) => {
 });
 
 api.post("/agent/market/orders/:id/fund-check", async (c) => {
-  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId, agentId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const { checkFunding } = await import("./market");
-  const result = await checkFunding(c.env.DB, c.env, c.req.param("id"), { walletId: wallet.id, agentId: agent.id }, {
+  const result = await checkFunding(c.env.DB, c.env, c.req.param("id"), { walletId, agentId }, {
     refundAddress: typeof body.refundAddress === "string" ? body.refundAddress : undefined,
   });
   return c.json(result);
 });
 
 api.post("/agent/market/orders/:id/deliver", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const { deliverOrder } = await import("./market");
-  const result = await deliverOrder(c.env.DB, c.env, wallet.id, c.req.param("id"), {
+  const result = await deliverOrder(c.env.DB, c.env, walletId, c.req.param("id"), {
     kind: body.kind,
     hash: body.hash,
     carrier: body.carrier,
@@ -1873,25 +1873,25 @@ api.post("/agent/market/orders/:id/deliver", async (c) => {
 });
 
 api.post("/agent/market/orders/:id/approve", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const { approveOrder } = await import("./market");
-  const result = await approveOrder(c.env.DB, c.env, c.req.param("id"), wallet.id);
+  const result = await approveOrder(c.env.DB, c.env, c.req.param("id"), walletId);
   return c.json(result);
 });
 
 api.post("/agent/market/orders/:id/dispute", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const { disputeOrder } = await import("./market");
-  const result = await disputeOrder(c.env.DB, c.req.param("id"), wallet.id, body.reason);
+  const result = await disputeOrder(c.env.DB, c.req.param("id"), walletId, body.reason);
   return c.json(result, 201);
 });
 
 api.post("/agent/market/orders/:id/evidence", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const { disputeEvidence } = await import("./market");
-  const result = await disputeEvidence(c.env.DB, c.req.param("id"), wallet.id, {
+  const result = await disputeEvidence(c.env.DB, c.req.param("id"), walletId, {
     text: body.text,
     hashes: body.hashes,
   });
@@ -1899,9 +1899,9 @@ api.post("/agent/market/orders/:id/evidence", async (c) => {
 });
 
 api.post("/agent/market/orders/:id/cancel", async (c) => {
-  const { wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
   const { cancelOrder } = await import("./market");
-  const result = await cancelOrder(c.env.DB, wallet.id, c.req.param("id"));
+  const result = await cancelOrder(c.env.DB, walletId, c.req.param("id"));
   return c.json(result);
 });
 

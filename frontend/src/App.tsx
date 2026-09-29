@@ -366,7 +366,7 @@ export default function App() {
             <ServicesPanel data={services} onReload={() => void loadServices()} />
           )}
 
-          {tab === "market" && <MarketPanel walletId={data.wallet.id} />}
+          {tab === "market" && <MarketPanel token={token} walletId={data.wallet.id} />}
         </>
       )}
 
@@ -1894,7 +1894,30 @@ function LedgerTable({
   );
 }
 
-const MARKET_KEY = "agentpay_market_key";
+const PAYOUT_KEY = "agentpay_market_payout";
+
+/** Hash a local file to sha256 hex (content hashes, delivery proofs). */
+async function sha256File(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const EXPLORER_TX = "https://whatsonchain.com/tx/";
+
+function statusWords(status: string): string {
+  switch (status) {
+    case "open": return "Open — waiting for a buyer to fund escrow";
+    case "funded": return "Funded — waiting for the seller to deliver";
+    case "delivered": return "Delivered — waiting for buyer approval";
+    case "disputed": return "Disputed — awaiting arbitration";
+    case "paid": return "Paid — released to the seller";
+    case "refunded": return "Refunded to the buyer";
+    case "expired": return "Expired — auto-released to the seller";
+    case "cancelled": return "Cancelled by the seller";
+    default: return status;
+  }
+}
 
 interface MarketOrderPublic {
   id: string;
@@ -1906,25 +1929,24 @@ interface MarketOrderPublic {
   escrow_address: string | null;
 }
 
-/** P2P trade with on-chain escrow. Actions need an agent key (buyer or seller side). */
-function MarketPanel({ walletId }: { walletId: string }) {
-  const [agentKey, setAgentKey] = useState(() => localStorage.getItem(MARKET_KEY) ?? "");
+/** P2P trade with on-chain escrow. Signed in with the wallet token, so no
+ *  agent key is needed: the server accepts either credential for these
+ *  routes (the wallet token already confers full wallet powers). */
+function MarketPanel({ token, walletId }: { token: string; walletId: string }) {
   const [open, setOpen] = useState<MarketOrderPublic[]>([]);
   const [mine, setMine] = useState<Array<Record<string, unknown>>>([]);
   const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [form, setForm] = useState({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: "", buyerWalletId: "" });
+  const [form, setForm] = useState({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: typeof localStorage !== "undefined" ? localStorage.getItem(PAYOUT_KEY) ?? "" : "", buyerWalletId: "" });
   const [deliver, setDeliver] = useState({ hash: "", carrier: "", tracking: "", note: "" });
   const [disputeReason, setDisputeReason] = useState("");
   const [evidence, setEvidence] = useState("");
 
-  // Agent routes need an agp_ agent key as the bearer value (api() sends
-  // its `token` param as Authorization: Bearer).
-  const authed = async <T,>(path: string, body?: unknown): Promise<T> => {
-    if (!agentKey.trim()) throw new Error("Paste an agent key below first (mint one under Agents).");
-    return api<T>(path, { method: body === undefined ? "GET" : "POST", body, token: agentKey.trim() });
-  };
+  // Signed in with the wallet token: the server accepts it on market
+  // routes, so no agent key is needed here.
+  const authed = async <T,>(path: string, body?: unknown): Promise<T> =>
+    api<T>(path, { method: body === undefined ? "GET" : "POST", body, token });
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
 
   const reload = async () => {
@@ -1932,9 +1954,7 @@ function MarketPanel({ walletId }: { walletId: string }) {
     try {
       const [o, m] = await Promise.all([
         api<{ orders: MarketOrderPublic[] }>("/market/orders"),
-        agentKey.trim()
-          ? api<{ orders: Array<Record<string, unknown>> }>("/agent/market/orders", { token: agentKey.trim() }).catch(() => ({ orders: [] }))
-          : Promise.resolve({ orders: [] }),
+        api<{ orders: Array<Record<string, unknown>> }>("/agent/market/orders", { token }).catch(() => ({ orders: [] })),
       ]);
       setOpen(o.orders ?? []);
       setMine(m.orders ?? []);
@@ -1948,10 +1968,9 @@ function MarketPanel({ walletId }: { walletId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const saveKey = (v: string) => {
-    setAgentKey(v);
-    if (v.trim()) localStorage.setItem(MARKET_KEY, v.trim());
-    else localStorage.removeItem(MARKET_KEY);
+  const rememberPayout = (v: string) => {
+    setForm((f) => ({ ...f, payoutAddress: v }));
+    if (v.trim()) localStorage.setItem(PAYOUT_KEY, v.trim());
   };
 
   const roleOf = (o: Record<string, unknown>): string => {
@@ -1960,12 +1979,31 @@ function MarketPanel({ walletId }: { walletId: string }) {
     return "";
   };
 
-  const openDetail = async (id: string) => {
-    setError("");
-    setNotice("");
+  const openDetail = async (id: string, quiet = false) => {
+    if (!quiet) {
+      setError("");
+      setNotice("");
+    }
     try {
       const r = await api<{ order: Record<string, unknown> }>(`/market/orders/${encodeURIComponent(id)}`);
       setDetail(r.order);
+    } catch (e) {
+      if (!quiet) fail(e);
+    }
+  };
+
+  const copy = (text: string, label: string) => {
+    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    setNotice(`${label} copied.`);
+  };
+
+  const hashFile = async (file: File | undefined, apply: (hex: string) => void) => {
+    if (!file) return;
+    try {
+      setNotice(`Hashing ${file.name}…`);
+      setError("");
+      apply(await sha256File(file));
+      setNotice("");
     } catch (e) {
       fail(e);
     }
@@ -2008,6 +2046,17 @@ function MarketPanel({ walletId }: { walletId: string }) {
   const myRow = d ? mine.find((o) => o.id === d.id) : undefined;
   const myRole = myRow ? roleOf(myRow) : "";
 
+  // While an open order is on screen, poll its public status so funding
+  // lands without hunting for txids. Read-only: claiming the buyer role
+  // stays an explicit click on "I've funded — check".
+  useEffect(() => {
+    if (!d || d.status !== "open") return undefined;
+    const id = d.id;
+    const t = setInterval(() => void openDetail(id, true), 10000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [d?.id, d?.status]);
+
   return (
     <section className="card">
       <h2>Marketplace</h2>
@@ -2015,10 +2064,6 @@ function MarketPanel({ walletId }: { walletId: string }) {
         Fixed-price P2P trade with on-chain escrow. Sellers list, buyers fund the escrow address directly,
         sellers deliver, buyers approve — disputes go to Jev-advised arbitration. 2% platform fee on release.
       </p>
-      <label>
-        Agent key (buyer or seller side)
-        <input value={agentKey} onChange={(e) => saveKey(e.target.value)} placeholder="agp_…" />
-      </label>
       {error && <div className="banner bad">{error}</div>}
       {notice && <div className="banner">{notice}</div>}
 
@@ -2034,8 +2079,15 @@ function MarketPanel({ walletId }: { walletId: string }) {
           </select>
         </label>
       </div>
-      <label>Content sha256 (digital, optional — enables exact-match delivery)<input value={form.contentHash} onChange={(e) => setForm({ ...form, contentHash: e.target.value })} placeholder="64 hex" /></label>
-      <label>Your payout address<input value={form.payoutAddress} onChange={(e) => setForm({ ...form, payoutAddress: e.target.value })} placeholder="BSV P2PKH address" /></label>
+      <label>Content sha256 (digital, optional — enables exact-match delivery)
+        <div className="row">
+          <input value={form.contentHash} onChange={(e) => setForm({ ...form, contentHash: e.target.value })} placeholder="64 hex" style={{ flex: 1 }} />
+          <label className="ghost" style={{ cursor: "pointer" }}>Hash a file
+            <input type="file" hidden onChange={(e) => void hashFile(e.target.files?.[0], (hex) => setForm((f) => ({ ...f, contentHash: hex })))} />
+          </label>
+        </div>
+      </label>
+      <label>Your payout address<input value={form.payoutAddress} onChange={(e) => rememberPayout(e.target.value)} placeholder="BSV P2PKH address" /></label>
       <label>Private buyer wallet id (optional — OTC listing)<input value={form.buyerWalletId} onChange={(e) => setForm({ ...form, buyerWalletId: e.target.value })} placeholder="apw_…" /></label>
       <div className="row"><button className="primary" onClick={() => void create()}>List item</button></div>
 
@@ -2048,7 +2100,7 @@ function MarketPanel({ walletId }: { walletId: string }) {
             <span className="muted">{o.price_sats.toLocaleString()} sats · {o.fulfillment}</span>
           </div>
           <p>{o.description}</p>
-          <div className="row"><button className="ghost" onClick={() => void openDetail(o.id)}>Open</button></div>
+          <div className="row"><button className="ghost" onClick={() => void openDetail(o.id)}>Open &amp; buy</button></div>
         </div>
       ))}
 
@@ -2068,11 +2120,21 @@ function MarketPanel({ walletId }: { walletId: string }) {
         <div className="service">
           <div className="serviceHead">
             <strong>{String(d.title ?? d.id)}</strong>
-            <span className="muted">{String(d.status)}{myRole ? ` · you are ${myRole}` : ""}</span>
+            <span className="muted">{statusWords(String(d.status))}{myRole ? ` · you are ${myRole}` : ""}</span>
           </div>
           <p>{String(d.description ?? "")}</p>
           {typeof d.escrow_address === "string" && d.escrow_address && (
-            <p className="muted">Escrow: <code>{d.escrow_address}</code></p>
+            <p className="muted">Escrow: <code>{d.escrow_address}</code>{" "}
+              <button className="ghost" onClick={() => copy(d.escrow_address as string, "Escrow address")}>Copy</button></p>
+          )}
+          {typeof d.payout_txid === "string" && d.payout_txid && (
+            <p className="muted">Paid: <a href={`${EXPLORER_TX}${d.payout_txid}`} target="_blank" rel="noreferrer">{String(d.payout_txid).slice(0, 12)}…</a></p>
+          )}
+          {typeof d.refund_txid === "string" && d.refund_txid && (
+            <p className="muted">Refunded: <a href={`${EXPLORER_TX}${d.refund_txid}`} target="_blank" rel="noreferrer">{String(d.refund_txid).slice(0, 12)}…</a></p>
+          )}
+          {typeof d.funding_txid === "string" && d.funding_txid && (
+            <p className="muted">Funding: <a href={`${EXPLORER_TX}${d.funding_txid}`} target="_blank" rel="noreferrer">{String(d.funding_txid).slice(0, 12)}…</a></p>
           )}
           {typeof d.tracking === "string" && d.tracking && (
             <p>Tracking: <code>{d.tracking}</code>{typeof d.carrier === "string" && d.carrier ? ` via ${d.carrier}` : ""}</p>
@@ -2088,8 +2150,11 @@ function MarketPanel({ walletId }: { walletId: string }) {
           {myRole === "buyer" && d.status === "open" && (
             <p className="muted">Fund the escrow address above, then press check funding.</p>
           )}
+          {d.status === "open" && (
+            <p className="muted">Send the asking price to the escrow address above, then press below — checking claims the buyer role.</p>
+          )}
           <div className="row">
-            <button className="ghost" onClick={() => void act(String(d.id), "/fund-check", {})}>Check funding</button>
+            <button className="ghost" onClick={() => void act(String(d.id), "/fund-check", {})}>I&apos;ve funded — check</button>
             {myRole === "seller" && d.status === "funded" && (
               <>
                 <button className="ghost" onClick={() => {
@@ -2100,6 +2165,9 @@ function MarketPanel({ walletId }: { walletId: string }) {
                   }, "Delivered.");
                 }}>Deliver</button>
                 <input value={deliver.hash} onChange={(e) => setDeliver({ ...deliver, hash: e.target.value })} placeholder="sha256 (digital)" />
+                <label className="ghost" style={{ cursor: "pointer" }}>Hash a file
+                  <input type="file" hidden onChange={(e) => void hashFile(e.target.files?.[0], (hex) => setDeliver((dl) => ({ ...dl, hash: hex })))} />
+                </label>
                 <input value={deliver.tracking} onChange={(e) => setDeliver({ ...deliver, tracking: e.target.value })} placeholder="tracking # (physical)" />
               </>
             )}

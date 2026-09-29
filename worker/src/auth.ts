@@ -35,6 +35,26 @@ export function bearerToken(request: Request): string | null {
   return match ? match[1].trim() : null;
 }
 
+/**
+ * Either credential for owner-level marketplace actions: an agent key
+ * (scoped, revocable) or the wallet token itself (the dashboard already
+ * holds it, so users never paste keys). Safe because the wallet token
+ * already confers full wallet powers — market actions grant nothing new.
+ * Returns the wallet id plus the agent id, or null when agent-authed.
+ */
+export async function requireAgentOrWallet(
+  request: Request,
+  db: D1Database,
+): Promise<{ walletId: string; agentId: string | null }> {
+  const token = bearerToken(request);
+  if (token?.startsWith(AGENT_KEY_PREFIX)) {
+    const { agent, wallet } = await requireAgent(request, db);
+    return { walletId: wallet.id, agentId: agent.id };
+  }
+  const wallet = await requireWallet(request, db);
+  return { walletId: wallet.id, agentId: null };
+}
+
 export async function requireWallet(request: Request, db: D1Database): Promise<WalletRow> {
   const token = bearerToken(request);
   if (!token) throw new HttpError(401, "Missing wallet token (Authorization: Bearer apw_…)");
