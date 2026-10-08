@@ -21,7 +21,7 @@ import {
   type SubagentRow,
   type WalletRow,
 } from "./types";
-import { requireAgent, requireAgentOrWallet, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
+import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
   agentSpendAllowed,
   agentToolAllowed,
@@ -109,6 +109,7 @@ import { getCachedBsvUsd } from "./price";
 import {
   bountyPayoutInfo,
   bountyRecord,
+  chargeCentsForSats,
   claimBountyRemote,
   getBounty,
   getLink,
@@ -121,11 +122,14 @@ import {
   postFundedBounty,
   publicEscrow,
   retryFundedBounty,
+  satsPerCent,
   settleFundedBounty,
   submitWorkRemote,
   touchLinkStatus,
   workerRefFor,
 } from "./bounties";
+import { arcBroadcastTx, buildDirectSendTx } from "./escrow";
+import { PrivateKey } from "@bsv/sdk";
 import {
   chargeCentsFor,
   maxPaymentSats,
@@ -136,7 +140,7 @@ import {
   treasuryStatus,
 } from "./x402";
 import { API_PREFIX, APP_PREFIX, MCP_PATH, PUBLIC_SITE, siteOrigin } from "./paths";
-import { cleanStr, nowIso, sha256Hex, timingSafeEqualStr } from "./ids";
+import { cleanStr, newId, nowIso, sha256Hex, timingSafeEqualStr } from "./ids";
 import { verifyGoogleIdToken } from "./google";
 
 const CORS_HEADERS: Record<string, string> = {
@@ -1652,6 +1656,105 @@ api.get("/agent/receipts/:id", async (c) => {
   return c.json({ receipt: publicReceipt(receipt) });
 });
 
+// ---------- Direct BSV send (POST /agent/send) ----------
+//
+// Agent-initiated BSV send from the treasury, debited against the agent's
+// wallet balance. Idempotent per (wallet_id, idempotency_key): a retry with
+// the same key returns the original txid instead of broadcasting again.
+api.post("/agent/send", async (c) => {
+  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    dest?: unknown;
+    sats?: unknown;
+    memo?: unknown;
+    idempotency_key?: unknown;
+  };
+
+  const dest = cleanStr(body.dest, 100);
+  if (!dest || !isValidBsvAddress(dest)) {
+    throw new HttpError(400, "dest must be a valid BSV P2PKH address");
+  }
+  const sats = Math.floor(Number(body.sats));
+  if (!Number.isInteger(sats) || sats <= 0) {
+    throw new HttpError(400, "sats must be a positive integer");
+  }
+  const memo = cleanStr(body.memo, 200) || "";
+  const idempotencyKey = cleanStr(body.idempotency_key, 120) || null;
+
+  // Idempotency: return the original result if this key was seen.
+  if (idempotencyKey) {
+    const prior = await c.env.DB.prepare(
+      "SELECT txid, status, sats, dest FROM ap_sends WHERE wallet_id = ? AND idempotency_key = ?",
+    )
+      .bind(wallet.id, idempotencyKey)
+      .first<{ txid: string | null; status: string; sats: number; dest: string }>();
+    if (prior) {
+      if (prior.status === "complete" && prior.txid) {
+        return c.json({ ok: true, settlement: "live", txid: prior.txid, dest: prior.dest, sats: prior.sats });
+      }
+      throw new HttpError(409, "A send with this idempotency key is already in progress");
+    }
+  }
+
+  const wif = c.env.SITE_WALLET_WIF?.trim();
+  if (!wif) throw new HttpError(503, "BSV treasury is not configured (SITE_WALLET_WIF missing)");
+
+  // Debit the agent's wallet (cents) for the sats being sent.
+  const { resolveSatsPerCent } = await import("./price");
+  const { perCent } = await resolveSatsPerCent(c.env, c.env.DB, satsPerCent(c.env));
+  const amountCents = chargeCentsForSats(sats, c.env, perCent);
+
+  const sendId = newId("snd");
+  await c.env.DB.prepare(
+    `INSERT INTO ap_sends (id, wallet_id, agent_id, dest, sats, memo, idempotency_key, status, charged_cents)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+  )
+    .bind(sendId, wallet.id, agent.id, dest, sats, memo, idempotencyKey, amountCents)
+    .run();
+
+  try {
+    await spend(c.env.DB, {
+      walletId: wallet.id,
+      agent,
+      amountCents,
+      description: memo || `Direct send: ${sats} sats to ${dest.slice(0, 12)}…`,
+      service: "agentpay",
+      tool: "agent_send",
+      ref: `send:${sendId}`,
+      meta: { sats, dest, idempotencyKey },
+    });
+  } catch (err) {
+    await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
+    throw err;
+  }
+
+  let txid: string;
+  try {
+    const tx = await buildDirectSendTx({
+      env: c.env,
+      treasuryKey: PrivateKey.fromWif(wif),
+      dest,
+      satoshis: sats,
+      marker: `agentpay:send:${sendId}`,
+    });
+    const broadcast = await arcBroadcastTx(c.env, tx.toHex());
+    txid = broadcast.txid || tx.id("hex");
+  } catch (err) {
+    // Broadcast failed: the ledger debit stands (funds are accounted), but
+    // mark the send failed so a retry with the same idempotency key can proceed.
+    await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
+    throw err;
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE ap_sends SET status = 'complete', txid = ?, completed_at = datetime('now') WHERE id = ?",
+  )
+    .bind(txid, sendId)
+    .run();
+
+  return c.json({ ok: true, settlement: "live", txid, dest, sats });
+});
+
 // ---------- BSVBounties bridge (earn side) ----------
 //
 // Agents browse and claim work through their agentpay key. Claims are linked
@@ -1787,134 +1890,6 @@ api.get("/agent/bounties", async (c) => {
   const { wallet } = await requireAgent(c.req.raw, c.env.DB);
   const links = await listLinks(c.env.DB, wallet.id);
   return c.json({ bounties: links });
-});
-
-// ---------- Marketplace: P2P trade with on-chain escrow ----------
-//
-// Sellers list digital goods or physical items; buyers fund escrow directly;
-// sellers deliver; buyers approve. Disputes get a Jev recommendation with
-// operator execution. Delivery/tracking content never touches agent keys.
-
-api.get("/market/orders", async (c) => {
-  const { listOpenOrders, publicOrder } = await import("./market");
-  const limit = Number(c.req.query("limit") ?? 25);
-  const rows = await listOpenOrders(c.env.DB, Number.isFinite(limit) ? limit : 25);
-  const out = [];
-  for (const r of rows) out.push(await publicOrder(c.env.DB, r));
-  return c.json({ orders: out });
-});
-
-api.get("/market/orders/:id", async (c) => {
-  const { getOrder, publicOrder, settleDueOrders } = await import("./market");
-  const order = await getOrder(c.env.DB, c.req.param("id"));
-  if (!order) throw new HttpError(404, "Order not found");
-  await settleDueOrders(c.env.DB, c.env).catch(() => {});
-  const fresh = (await getOrder(c.env.DB, c.req.param("id")))!;
-  return c.json({ order: await publicOrder(c.env.DB, fresh) });
-});
-
-api.post("/agent/market/orders", async (c) => {
-  const { walletId, agentId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const { createOrder } = await import("./market");
-  const { order, escrowAddress } = await createOrder(
-    c.env.DB,
-    c.env,
-    { walletId, agentId },
-    {
-      title: body.title,
-      description: body.description,
-      priceSats: body.priceSats,
-      fulfillment: body.fulfillment,
-      contentHash: body.contentHash,
-      payoutAddress: body.payoutAddress,
-      buyerWalletId: body.buyerWalletId,
-    },
-  );
-  return c.json({ order, escrowAddress }, 201);
-});
-
-api.get("/agent/market/orders", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const { getOrder } = await import("./market");
-  const rows = await c.env.DB.prepare(
-    "SELECT id FROM ap_market_orders WHERE seller_wallet_id = ? OR buyer_wallet_id = ? ORDER BY created_at DESC LIMIT 50",
-  ).bind(walletId, walletId).all<{ id: string }>();
-  const orders = [];
-  for (const r of rows.results ?? []) {
-    const order = await getOrder(c.env.DB, r.id);
-    if (order) orders.push(order);
-  }
-  return c.json({ orders });
-});
-
-api.post("/agent/market/orders/:id/fund-check", async (c) => {
-  const { walletId, agentId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const { checkFunding } = await import("./market");
-  const result = await checkFunding(c.env.DB, c.env, c.req.param("id"), { walletId, agentId }, {
-    refundAddress: typeof body.refundAddress === "string" ? body.refundAddress : undefined,
-  });
-  return c.json(result);
-});
-
-api.post("/agent/market/orders/:id/deliver", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const { deliverOrder } = await import("./market");
-  const result = await deliverOrder(c.env.DB, c.env, walletId, c.req.param("id"), {
-    kind: body.kind,
-    hash: body.hash,
-    carrier: body.carrier,
-    tracking: body.tracking,
-    note: body.note,
-  });
-  return c.json(result);
-});
-
-api.post("/agent/market/orders/:id/approve", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const { approveOrder } = await import("./market");
-  const result = await approveOrder(c.env.DB, c.env, c.req.param("id"), walletId);
-  return c.json(result);
-});
-
-api.post("/agent/market/orders/:id/dispute", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const { disputeOrder } = await import("./market");
-  const result = await disputeOrder(c.env.DB, c.req.param("id"), walletId, body.reason);
-  return c.json(result, 201);
-});
-
-api.post("/agent/market/orders/:id/evidence", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const { disputeEvidence } = await import("./market");
-  const result = await disputeEvidence(c.env.DB, c.req.param("id"), walletId, {
-    text: body.text,
-    hashes: body.hashes,
-  });
-  return c.json(result, 201);
-});
-
-api.post("/agent/market/orders/:id/cancel", async (c) => {
-  const { walletId } = await requireAgentOrWallet(c.req.raw, c.env.DB);
-  const { cancelOrder } = await import("./market");
-  const result = await cancelOrder(c.env.DB, walletId, c.req.param("id"));
-  return c.json(result);
-});
-
-/** Operator resolves a dispute: Jev recommends, the operator executes. */
-api.post("/agent/market/orders/:id/resolve", async (c) => {
-  const secret = (c.env.ADMIN_SECRET ?? "").trim();
-  const provided = (c.req.header("x-admin-secret") ?? "").trim();
-  if (!secret || !provided || !timingSafeEqualStr(provided, secret)) throw new HttpError(403, "operator only");
-  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const override = body.override === "release" || body.override === "refund" ? body.override : undefined;
-  const { resolveOrder } = await import("./market");
-  const result = await resolveOrder(c.env.DB, c.env, c.req.param("id"), override ? { override } : {});
-  return c.json(result);
 });
 
 /** Settle callback from bsv-bounties (server-to-server, shared secret). */

@@ -42,9 +42,6 @@ export const MCP_TOOLS = [
   "post_bounty",
   "settle_bounty",
   "my_escrows",
-  "market_list",
-  "market_get",
-  "market_order",
 ] as const;
 
 export const MCP_INSTRUCTIONS = [
@@ -63,7 +60,6 @@ export const MCP_INSTRUCTIONS = [
   "Reputation: get_attestation returns an agentpay-signed summary of the wallet's settled activity. Sellers verify it at /attestations/verify (or with the public key at /attestations/key) to price trust — for example, a discount for wallets with a proven payment history.",
   "Earning: list_bounties and get_bounty browse paid work on the BSVBounties marketplace. claim_bounty links a bounty to this wallet (pass payoutAddress to receive sats on-chain instead of a balance credit); submit_work submits it; my_bounties lists your claims. When a linked bounty settles, the reward is credited to your wallet balance (idempotent) so you can spend it on x402 services — earn and spend from one key.",
   "Posting: post_bounty funds a new listing from your wallet balance and escrows the sats on-chain from the treasury to a per-bounty key; my_escrows tracks funding, payout, and refund txids. As poster you decide with settle_bounty (outcome paid or refunded): paid spends the escrow to the worker (net of the platform fee) and refunded returns it to the treasury and credits your balance back.",
-  "Marketplace: market_list and market_get browse fixed-price P2P trade (digital goods, physical items) with on-chain escrow; market_order lists your item (buyer funds the escrow address directly, you deliver, buyer approves, disputes go to Jev-advised arbitration). 2% platform fee on release.",
   "When the balance is low, call create_topup_link (or pay_service will fail with 402) and hand the Stripe Checkout URL to a human — agents cannot pay by card themselves.",
 ].join("\n");
 
@@ -558,67 +554,6 @@ export function createAgentPayMcpServer(
     },
     async ({ key }) => {
       const { status, json } = await call("GET", "/agent/bounties/escrows", { key });
-      if (status >= 400) return fail(status, json);
-      return ok(json);
-    },
-  );
-
-  server.registerTool(
-    "market_list",
-    {
-      title: "List marketplace orders",
-      description:
-        "Browse open fixed-price P2P trade orders (digital goods, physical items) held in on-chain escrow. Public — no key required.",
-      inputSchema: z.object({
-        limit: z.number().int().min(1).max(50).optional(),
-      }),
-    },
-    async ({ limit }) => {
-      const qs = limit ? `?limit=${limit}` : "";
-      const { status, json } = await call("GET", `/market/orders${qs}`);
-      if (status >= 400) return fail(status, json);
-      return ok(json);
-    },
-  );
-
-  server.registerTool(
-    "market_get",
-    {
-      title: "Get marketplace order",
-      description:
-        "Full detail for one marketplace order: price, escrow address, fulfillment, delivery, dispute state. Public — no key required.",
-      inputSchema: z.object({
-        orderId: z.string().describe("Order id from market_list"),
-      }),
-    },
-    async ({ orderId }) => {
-      const { status, json } = await call("GET", `/market/orders/${encodeURIComponent(orderId)}`);
-      if (status >= 400) return fail(status, json);
-      return ok(json);
-    },
-  );
-
-  server.registerTool(
-    "market_order",
-    {
-      title: "List an item for sale",
-      description:
-        "List a digital good or physical item at a fixed price. Returns the order plus its on-chain escrow address — the buyer funds it directly, you deliver, the buyer approves, and disputes go to Jev-advised arbitration. 2% platform fee on release.",
-      inputSchema: z.object({
-        title: z.string().max(120),
-        description: z.string().max(2000),
-        priceSats: z.number().int().positive().describe("Fixed price in sats; must clear the fee floor"),
-        fulfillment: z.enum(["digital", "physical"]).optional().describe("Delivery kind (default digital)"),
-        contentHash: z.string().optional().describe("64-hex sha256 buyers can exact-match (digital)"),
-        payoutAddress: z.string().describe("Your BSV P2PKH address; release pays here"),
-        key: keyField,
-      }),
-    },
-    async ({ title, description, priceSats, fulfillment, contentHash, payoutAddress, key }) => {
-      const { status, json } = await call("POST", "/agent/market/orders", {
-        key,
-        body: { title, description, priceSats, fulfillment, contentHash, payoutAddress },
-      });
       if (status >= 400) return fail(status, json);
       return ok(json);
     },

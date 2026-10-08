@@ -256,6 +256,28 @@ export async function buildEscrowFundingTx(opts: {
   });
 }
 
+/** Treasury → destination P2PKH output for POST /agent/send, with an audit marker OP_RETURN. */
+export async function buildDirectSendTx(opts: {
+  env: AppEnv;
+  treasuryKey: PrivateKey;
+  dest: string;
+  satoshis: number;
+  marker: string;
+}): Promise<Transaction> {
+  const address = opts.treasuryKey.toAddress();
+  const utxos = await treasuryUtxos(opts.env, address);
+  if (utxos.length === 0) {
+    throw new HttpError(503, `Treasury ${address} has no confirmed UTXOs to send from`);
+  }
+  return buildP2pkhTx({
+    key: opts.treasuryKey,
+    utxos,
+    outputs: [{ address: opts.dest, satoshis: opts.satoshis }],
+    feeSats: feeSatsFor(opts.env),
+    marker: opts.marker,
+  });
+}
+
 /** Escrow key spends its single P2PKH UTXO into payout/refund outputs. */
 export async function buildEscrowSpendTx(opts: {
   env: AppEnv;

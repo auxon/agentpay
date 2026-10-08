@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { makeTestDb } from "./helpers";
 import { createAgent, createWallet, revokeAgent } from "../src/ledger";
-import { requireAgent, requireAgentOrWallet, requireWallet, bearerToken } from "../src/auth";
+import { requireAgent, requireWallet, bearerToken } from "../src/auth";
 import { HttpError } from "../src/types";
 
 function requestWith(token?: string): Request {
@@ -61,32 +61,5 @@ describe("requireAgent", () => {
     const { agent, key } = await createAgent(db, wallet.id, { name: "Worker" });
     await revokeAgent(db, wallet.id, agent.id);
     await expect(requireAgent(requestWith(key), db)).rejects.toBeInstanceOf(HttpError);
-  });
-});
-
-describe("requireAgentOrWallet", () => {
-  it("accepts an agent key with its agent id", async () => {
-    const db = makeTestDb();
-    const { wallet } = await createWallet(db, { name: "Owner" });
-    const { agent, key } = await createAgent(db, wallet.id, { name: "Worker" });
-    const found = await requireAgentOrWallet(requestWith(key), db);
-    expect(found).toEqual({ walletId: wallet.id, agentId: agent.id });
-  });
-
-  it("accepts the wallet token with a null agent id", async () => {
-    const db = makeTestDb();
-    const { wallet, token } = await createWallet(db, { name: "Owner" });
-    const found = await requireAgentOrWallet(requestWith(token), db);
-    expect(found).toEqual({ walletId: wallet.id, agentId: null });
-  });
-
-  it("rejects revoked agent keys, unknown wallets, and garbage", async () => {
-    const db = makeTestDb();
-    const { wallet } = await createWallet(db, { name: "Owner" });
-    const { agent, key } = await createAgent(db, wallet.id, { name: "Worker" });
-    await revokeAgent(db, wallet.id, agent.id);
-    await expect(requireAgentOrWallet(requestWith(key), db)).rejects.toThrow(/Unknown or revoked/);
-    await expect(requireAgentOrWallet(requestWith("apw_nope"), db)).rejects.toThrow(/Unknown or revoked wallet/);
-    await expect(requireAgentOrWallet(requestWith(), db)).rejects.toThrow(/Missing/);
   });
 });

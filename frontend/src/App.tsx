@@ -64,7 +64,7 @@ export default function App() {
   const [services, setServices] = useState<ServicesResponse | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [tab, setTab] = useState<"wallet" | "agents" | "services" | "market">("wallet");
+  const [tab, setTab] = useState<"wallet" | "agents" | "services">("wallet");
   const [loading, setLoading] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [highlightApproval, setHighlightApproval] = useState("");
@@ -300,9 +300,6 @@ export default function App() {
             <button className={tab === "services" ? "tab active" : "tab"} onClick={() => setTab("services")}>
               Services
             </button>
-            <button className={tab === "market" ? "tab active" : "tab"} onClick={() => setTab("market")}>
-              Market
-            </button>
           </nav>
 
           {tab === "wallet" && (
@@ -365,8 +362,6 @@ export default function App() {
           {tab === "services" && (
             <ServicesPanel data={services} onReload={() => void loadServices()} />
           )}
-
-          {tab === "market" && <MarketPanel token={token} walletId={data.wallet.id} />}
         </>
       )}
 
@@ -485,13 +480,6 @@ function GoogleSignInButton({ onSignedIn }: { onSignedIn: (res: GoogleSignInResu
   const onSignedInRef = useRef(onSignedIn);
   onSignedInRef.current = onSignedIn;
 
-  // NOTE (2026-09-28): the button used to never render. The old code called
-  // setConfigured(true) and then, in the same tick, renderButton(btnRef)
-  // — but the div only mounts on the re-render that setConfigured triggers,
-  // so btnRef.current was always null and the guarded render was skipped
-  // silently, for everyone, in every browser. The button below renders in a
-  // separate effect that runs after the div mounts; initialize failures now
-  // surface instead of dying quiet.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -505,55 +493,38 @@ function GoogleSignInButton({ onSignedIn }: { onSignedIn: (res: GoogleSignInResu
         if (!cancelled) setError(message(err));
         return;
       }
-      if (cancelled || !window.google?.accounts?.id) {
-        if (!cancelled) setError("Google sign-in failed to start");
-        return;
-      }
-      try {
-        window.google.accounts.id.initialize({
-          client_id: cfg.clientId,
-          callback: (resp: GoogleCredentialResponse) => {
-            void (async () => {
-              setError("");
-              try {
-                const res = await api<GoogleSignInResult>("/auth/google", {
-                  method: "POST",
-                  body: { idToken: resp.credential },
-                });
-                onSignedInRef.current(res, resp.credential);
-              } catch (err) {
-                setError(message(err));
-              }
-            })();
-          },
+      if (cancelled || !window.google) return;
+      window.google.accounts.id.initialize({
+        client_id: cfg.clientId,
+        callback: (resp: GoogleCredentialResponse) => {
+          void (async () => {
+            setError("");
+            try {
+              const res = await api<GoogleSignInResult>("/auth/google", {
+                method: "POST",
+                body: { idToken: resp.credential },
+              });
+              onSignedInRef.current(res, resp.credential);
+            } catch (err) {
+              setError(message(err));
+            }
+          })();
+        },
+      });
+      setConfigured(true);
+      if (btnRef.current) {
+        window.google.accounts.id.renderButton(btnRef.current, {
+          theme: "outline",
+          size: "large",
+          text: "signin_with",
+          width: 280,
         });
-      } catch (err) {
-        if (!cancelled) setError(message(err));
-        return;
       }
-      if (!cancelled) setConfigured(true);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
-
-  // Runs after the div above mounts, so the ref is set. Guards against
-  // double-render (StrictMode remounts) by rendering only into an empty div.
-  useEffect(() => {
-    if (!configured || !btnRef.current || !window.google?.accounts?.id) return;
-    if (btnRef.current.childElementCount > 0) return;
-    try {
-      window.google.accounts.id.renderButton(btnRef.current, {
-        theme: "outline",
-        size: "large",
-        text: "signin_with",
-        width: 280,
-      });
-    } catch (err) {
-      setError(message(err));
-    }
-  }, [configured]);
 
   if (!configured && !error) return null;
   return (
@@ -1891,306 +1862,6 @@ function LedgerTable({
       </tbody>
       </table>
     </>
-  );
-}
-
-const PAYOUT_KEY = "agentpay_market_payout";
-
-/** Hash a local file to sha256 hex (content hashes, delivery proofs). */
-async function sha256File(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  const digest = await crypto.subtle.digest("SHA-256", buf);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-const EXPLORER_TX = "https://whatsonchain.com/tx/";
-
-function statusWords(status: string): string {
-  switch (status) {
-    case "open": return "Open — waiting for a buyer to fund escrow";
-    case "funded": return "Funded — waiting for the seller to deliver";
-    case "delivered": return "Delivered — waiting for buyer approval";
-    case "disputed": return "Disputed — awaiting arbitration";
-    case "paid": return "Paid — released to the seller";
-    case "refunded": return "Refunded to the buyer";
-    case "expired": return "Expired — auto-released to the seller";
-    case "cancelled": return "Cancelled by the seller";
-    default: return status;
-  }
-}
-
-interface MarketOrderPublic {
-  id: string;
-  title: string;
-  description: string;
-  price_sats: number;
-  fulfillment: string;
-  status: string;
-  escrow_address: string | null;
-}
-
-/** P2P trade with on-chain escrow. Signed in with the wallet token, so no
- *  agent key is needed: the server accepts either credential for these
- *  routes (the wallet token already confers full wallet powers). */
-function MarketPanel({ token, walletId }: { token: string; walletId: string }) {
-  const [open, setOpen] = useState<MarketOrderPublic[]>([]);
-  const [mine, setMine] = useState<Array<Record<string, unknown>>>([]);
-  const [detail, setDetail] = useState<Record<string, unknown> | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [form, setForm] = useState({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: typeof localStorage !== "undefined" ? localStorage.getItem(PAYOUT_KEY) ?? "" : "", buyerWalletId: "" });
-  const [deliver, setDeliver] = useState({ hash: "", carrier: "", tracking: "", note: "" });
-  const [disputeReason, setDisputeReason] = useState("");
-  const [evidence, setEvidence] = useState("");
-
-  // Signed in with the wallet token: the server accepts it on market
-  // routes, so no agent key is needed here.
-  const authed = async <T,>(path: string, body?: unknown): Promise<T> =>
-    api<T>(path, { method: body === undefined ? "GET" : "POST", body, token });
-  const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
-
-  const reload = async () => {
-    setError("");
-    try {
-      const [o, m] = await Promise.all([
-        api<{ orders: MarketOrderPublic[] }>("/market/orders"),
-        api<{ orders: Array<Record<string, unknown>> }>("/agent/market/orders", { token }).catch(() => ({ orders: [] })),
-      ]);
-      setOpen(o.orders ?? []);
-      setMine(m.orders ?? []);
-    } catch (e) {
-      fail(e);
-    }
-  };
-
-  useEffect(() => {
-    void reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const rememberPayout = (v: string) => {
-    setForm((f) => ({ ...f, payoutAddress: v }));
-    if (v.trim()) localStorage.setItem(PAYOUT_KEY, v.trim());
-  };
-
-  const roleOf = (o: Record<string, unknown>): string => {
-    if (o.seller_wallet_id === walletId) return "seller";
-    if (o.buyer_wallet_id === walletId) return "buyer";
-    return "";
-  };
-
-  const openDetail = async (id: string, quiet = false) => {
-    if (!quiet) {
-      setError("");
-      setNotice("");
-    }
-    try {
-      const r = await api<{ order: Record<string, unknown> }>(`/market/orders/${encodeURIComponent(id)}`);
-      setDetail(r.order);
-    } catch (e) {
-      if (!quiet) fail(e);
-    }
-  };
-
-  const copy = (text: string, label: string) => {
-    if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-    setNotice(`${label} copied.`);
-  };
-
-  const hashFile = async (file: File | undefined, apply: (hex: string) => void) => {
-    if (!file) return;
-    try {
-      setNotice(`Hashing ${file.name}…`);
-      setError("");
-      apply(await sha256File(file));
-      setNotice("");
-    } catch (e) {
-      fail(e);
-    }
-  };
-
-  const create = async () => {
-    setError("");
-    setNotice("");
-    try {
-      const r = await authed<{ order: Record<string, unknown>; escrowAddress: string }>("/agent/market/orders", {
-        title: form.title,
-        description: form.description,
-        priceSats: Number(form.priceSats),
-        fulfillment: form.fulfillment,
-        contentHash: form.contentHash || undefined,
-        payoutAddress: form.payoutAddress,
-        buyerWalletId: form.buyerWalletId || undefined,
-      });
-      setNotice(`Listed. Buyer funds this escrow address: ${r.escrowAddress}`);
-      setForm({ title: "", description: "", priceSats: "", fulfillment: "digital", contentHash: "", payoutAddress: "", buyerWalletId: "" });
-      await reload();
-    } catch (e) {
-      fail(e);
-    }
-  };
-
-  const act = async (id: string, path: string, body?: unknown, okMsg?: string) => {
-    setError("");
-    try {
-      await authed(`/agent/market/orders/${encodeURIComponent(id)}${path}`, body ?? {});
-      if (okMsg) setNotice(okMsg);
-      await openDetail(id);
-      await reload();
-    } catch (e) {
-      fail(e);
-    }
-  };
-
-  const d = detail as (Record<string, unknown> & { id: string; status: string }) | null;
-  const myRow = d ? mine.find((o) => o.id === d.id) : undefined;
-  const myRole = myRow ? roleOf(myRow) : "";
-
-  // While an open order is on screen, poll its public status so funding
-  // lands without hunting for txids. Read-only: claiming the buyer role
-  // stays an explicit click on "I've funded — check".
-  useEffect(() => {
-    if (!d || d.status !== "open") return undefined;
-    const id = d.id;
-    const t = setInterval(() => void openDetail(id, true), 10000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [d?.id, d?.status]);
-
-  return (
-    <section className="card">
-      <h2>Marketplace</h2>
-      <p className="muted">
-        Fixed-price P2P trade with on-chain escrow. Sellers list, buyers fund the escrow address directly,
-        sellers deliver, buyers approve — disputes go to Jev-advised arbitration. 2% platform fee on release.
-      </p>
-      {error && <div className="banner bad">{error}</div>}
-      {notice && <div className="banner">{notice}</div>}
-
-      <h3>Sell something</h3>
-      <label>Title<input value={form.title} maxLength={120} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="What are you selling?" /></label>
-      <label>Description<textarea value={form.description} maxLength={2000} rows={3} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Exactly what the buyer gets" /></label>
-      <div className="row">
-        <label>Price (sats)<input type="number" min={1} value={form.priceSats} onChange={(e) => setForm({ ...form, priceSats: e.target.value })} /></label>
-        <label>Fulfillment
-          <select value={form.fulfillment} onChange={(e) => setForm({ ...form, fulfillment: e.target.value })}>
-            <option value="digital">digital</option>
-            <option value="physical">physical</option>
-          </select>
-        </label>
-      </div>
-      <label>Content sha256 (digital, optional — enables exact-match delivery)
-        <div className="row">
-          <input value={form.contentHash} onChange={(e) => setForm({ ...form, contentHash: e.target.value })} placeholder="64 hex" style={{ flex: 1 }} />
-          <label className="ghost" style={{ cursor: "pointer" }}>Hash a file
-            <input type="file" hidden onChange={(e) => void hashFile(e.target.files?.[0], (hex) => setForm((f) => ({ ...f, contentHash: hex })))} />
-          </label>
-        </div>
-      </label>
-      <label>Your payout address<input value={form.payoutAddress} onChange={(e) => rememberPayout(e.target.value)} placeholder="BSV P2PKH address" /></label>
-      <label>Private buyer wallet id (optional — OTC listing)<input value={form.buyerWalletId} onChange={(e) => setForm({ ...form, buyerWalletId: e.target.value })} placeholder="apw_…" /></label>
-      <div className="row"><button className="primary" onClick={() => void create()}>List item</button></div>
-
-      <h3>Open orders</h3>
-      {open.length === 0 && <p className="muted">Nothing listed right now.</p>}
-      {open.map((o) => (
-        <div key={o.id} className="service">
-          <div className="serviceHead">
-            <strong>{o.title}</strong>
-            <span className="muted">{o.price_sats.toLocaleString()} sats · {o.fulfillment}</span>
-          </div>
-          <p>{o.description}</p>
-          <div className="row"><button className="ghost" onClick={() => void openDetail(o.id)}>Open &amp; buy</button></div>
-        </div>
-      ))}
-
-      <h3>My orders</h3>
-      {mine.length === 0 && <p className="muted">None yet — orders you sell or fund appear here.</p>}
-      {mine.map((o) => (
-        <div key={String(o.id)} className="service">
-          <div className="serviceHead">
-            <strong>{String(o.title)}</strong>
-            <span className="muted">{String(o.status)} · {roleOf(o)}</span>
-          </div>
-          <div className="row"><button className="ghost" onClick={() => void openDetail(String(o.id))}>Open</button></div>
-        </div>
-      ))}
-
-      {d && (
-        <div className="service">
-          <div className="serviceHead">
-            <strong>{String(d.title ?? d.id)}</strong>
-            <span className="muted">{statusWords(String(d.status))}{myRole ? ` · you are ${myRole}` : ""}</span>
-          </div>
-          <p>{String(d.description ?? "")}</p>
-          {typeof d.escrow_address === "string" && d.escrow_address && (
-            <p className="muted">Escrow: <code>{d.escrow_address}</code>{" "}
-              <button className="ghost" onClick={() => copy(d.escrow_address as string, "Escrow address")}>Copy</button></p>
-          )}
-          {typeof d.payout_txid === "string" && d.payout_txid && (
-            <p className="muted">Paid: <a href={`${EXPLORER_TX}${d.payout_txid}`} target="_blank" rel="noreferrer">{String(d.payout_txid).slice(0, 12)}…</a></p>
-          )}
-          {typeof d.refund_txid === "string" && d.refund_txid && (
-            <p className="muted">Refunded: <a href={`${EXPLORER_TX}${d.refund_txid}`} target="_blank" rel="noreferrer">{String(d.refund_txid).slice(0, 12)}…</a></p>
-          )}
-          {typeof d.funding_txid === "string" && d.funding_txid && (
-            <p className="muted">Funding: <a href={`${EXPLORER_TX}${d.funding_txid}`} target="_blank" rel="noreferrer">{String(d.funding_txid).slice(0, 12)}…</a></p>
-          )}
-          {typeof d.tracking === "string" && d.tracking && (
-            <p>Tracking: <code>{d.tracking}</code>{typeof d.carrier === "string" && d.carrier ? ` via ${d.carrier}` : ""}</p>
-          )}
-          {typeof d.dispute_reason === "string" && d.dispute_reason && <p>Dispute: {d.dispute_reason}</p>}
-          {Array.isArray(d.evidence) && d.evidence.length > 0 && (
-            <ul className="tools">
-              {(d.evidence as Array<Record<string, unknown>>).map((e, i) => (
-                <li key={i}><strong>{String(e.side)}:</strong> {String(e.text)}</li>
-              ))}
-            </ul>
-          )}
-          {myRole === "buyer" && d.status === "open" && (
-            <p className="muted">Fund the escrow address above, then press check funding.</p>
-          )}
-          {d.status === "open" && (
-            <p className="muted">Send the asking price to the escrow address above, then press below — checking claims the buyer role.</p>
-          )}
-          <div className="row">
-            <button className="ghost" onClick={() => void act(String(d.id), "/fund-check", {})}>I&apos;ve funded — check</button>
-            {myRole === "seller" && d.status === "funded" && (
-              <>
-                <button className="ghost" onClick={() => {
-                  const kind = deliver.hash.trim() ? "hash" : deliver.tracking.trim() ? "tracking" : "other";
-                  return void act(String(d.id), "/deliver", {
-                    kind, hash: deliver.hash || undefined, carrier: deliver.carrier || undefined,
-                    tracking: deliver.tracking || undefined, note: deliver.note || undefined,
-                  }, "Delivered.");
-                }}>Deliver</button>
-                <input value={deliver.hash} onChange={(e) => setDeliver({ ...deliver, hash: e.target.value })} placeholder="sha256 (digital)" />
-                <label className="ghost" style={{ cursor: "pointer" }}>Hash a file
-                  <input type="file" hidden onChange={(e) => void hashFile(e.target.files?.[0], (hex) => setDeliver((dl) => ({ ...dl, hash: hex })))} />
-                </label>
-                <input value={deliver.tracking} onChange={(e) => setDeliver({ ...deliver, tracking: e.target.value })} placeholder="tracking # (physical)" />
-              </>
-            )}
-            {myRole === "buyer" && d.status === "delivered" && (
-              <>
-                <button className="primary" onClick={() => void act(String(d.id), "/approve", {}, "Released to seller.")}>Approve &amp; release</button>
-                <input value={disputeReason} onChange={(e) => setDisputeReason(e.target.value)} placeholder="Dispute reason (min 20 chars)" />
-                <button className="ghost" onClick={() => void act(String(d.id), "/dispute", { reason: disputeReason }, "Disputed.")}>Dispute</button>
-              </>
-            )}
-            {(myRole === "seller" || myRole === "buyer") && d.status === "disputed" && (
-              <>
-                <input value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder="Evidence text" />
-                <button className="ghost" onClick={() => void act(String(d.id), "/evidence", { text: evidence }, "Evidence added.")}>Add evidence</button>
-              </>
-            )}
-            {myRole === "seller" && d.status === "open" && (
-              <button className="ghost" onClick={() => void act(String(d.id), "/cancel", {}, "Cancelled.")}>Cancel listing</button>
-            )}
-          </div>
-        </div>
-      )}
-    </section>
   );
 }
 

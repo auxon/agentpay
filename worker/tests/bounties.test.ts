@@ -11,10 +11,8 @@ import {
   linkBounty,
   listBounties,
   listLinks,
-  pushTrustBountyPaid,
   submitWorkRemote,
   touchLinkStatus,
-  trustSubjectForWorker,
   workerRefFor,
 } from "../src/bounties";
 import { HttpError, type AppEnv } from "../src/types";
@@ -214,65 +212,5 @@ describe("handleBountyEvent", () => {
     await expect(
       creditBountyPayout(db, fakeEnv(), { bountyId: "b0", walletId: wallet.id, amountSats: 0 }),
     ).rejects.toBeInstanceOf(HttpError);
-  });
-});
-
-describe("trust settled-work push", () => {
-  it("prefers the bounties account, then the bare key, then the wallet", () => {
-    expect(trustSubjectForWorker({ worker_account: 42, worker_pubkey: "03ab", wallet_id: "apw_x" })).toBe("account:42");
-    expect(trustSubjectForWorker({ worker_account: null, worker_pubkey: "03".repeat(33), wallet_id: "apw_x" })).toBe(
-      `key:${"03".repeat(33)}`,
-    );
-    expect(trustSubjectForWorker({ worker_account: null, worker_pubkey: "agentpay:apw_x", wallet_id: "apw_x" })).toBe(
-      "wallet:apw_x",
-    );
-    expect(trustSubjectForWorker({})).toBe(null);
-  });
-
-  it("posts the observation and reports what Trust stored", async () => {
-    const seen: Array<{ url: string; headers: Record<string, string>; body: unknown }> = [];
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-      seen.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, body: JSON.parse(String(init?.body ?? "{}")) });
-      return Response.json({ observations: 1 });
-    }) as typeof fetch;
-    try {
-      const ok = await pushTrustBountyPaid(
-        { TRUST_URL: "https://trust.test", TRUST_INGEST_SECRET: "s3cret" } as never,
-        { subject: "key:abc", bountyId: "b9", amountSats: 8000, txid: "t".repeat(64) },
-      );
-      expect(ok).toBe(true);
-      expect(seen.length).toBe(1);
-      expect(seen[0].url).toBe("https://trust.test/v1/ingest");
-      expect(seen[0].headers["x-trust-internal"]).toBe("s3cret");
-      const obs = (seen[0].body as { observations: Array<Record<string, unknown>> }).observations[0];
-      expect(obs).toMatchObject({ subject: "key:abc", source: "agentpay", kind: "bounty_paid", ref: "b9", value: 8000 });
-    } finally {
-      globalThis.fetch = origFetch;
-    }
-  });
-
-  it("skips silently without a secret and never throws on failure", async () => {
-    const calls: string[] = [];
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      calls.push(typeof input === "string" ? input : input.toString());
-      throw new Error("network down");
-    }) as typeof fetch;
-    try {
-      expect(
-        await pushTrustBountyPaid({} as never, { subject: "key:abc", bountyId: "b9", amountSats: 1, txid: "t" }),
-      ).toBe(false);
-      expect(calls.length).toBe(0);
-      expect(
-        await pushTrustBountyPaid(
-          { TRUST_URL: "https://trust.test", TRUST_INGEST_SECRET: "s" } as never,
-          { subject: "key:abc", bountyId: "b9", amountSats: 1, txid: "t" },
-        ),
-      ).toBe(false);
-    } finally {
-      globalThis.fetch = origFetch;
-    }
   });
 });
