@@ -1768,7 +1768,7 @@ function SubagentForm({
   return (
     <form className="form inline subForm" onSubmit={submit}>
       <span className="fine">
-        New sub-agent under <strong>{parentName}</strong>
+        New sub-agent under <strong>{parentName}</strong> — its spend also counts against {parentName}'s daily limit
       </span>
       <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Worker name" required />
       <input

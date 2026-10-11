@@ -554,10 +554,22 @@ export async function spend(db: D1Database, input: SpendInput): Promise<SpendRes
   }
   const description = cleanStr(input.description, DESCRIPTION_MAX);
   if (!description) throw new HttpError(400, "description is required");
+  const day = utcDay();
+
+  // Resolve the parent for delegated keys. Callers normally pass the joined
+  // row (requireAgent/listAgents/createSubagent all include parent_agent_id),
+  // but fall back to a lookup so a bare ap_agents row cannot dodge the cascade.
+  let parentId: string | null = input.agent?.parent_agent_id ?? null;
+  if (input.agent && !parentId) {
+    const link = await db
+      .prepare("SELECT parent_agent_id FROM ap_subagent_budgets WHERE agent_id = ?")
+      .bind(input.agent.id)
+      .first<{ parent_agent_id: string }>();
+    if (link?.parent_agent_id) parentId = link.parent_agent_id;
+  }
 
   // 1. Agent daily limit (guarded UPDATE also records the spend).
   if (input.agent) {
-    const day = utcDay();
     const res = await db
       .prepare(
         "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_day = ? THEN spent_today_cents + ? ELSE ? END, spent_day = ?, last_used_at = ? WHERE id = ? AND active = 1 AND (daily_limit_cents IS NULL OR (CASE WHEN spent_day = ? THEN spent_today_cents ELSE 0 END) + ? <= daily_limit_cents)",
@@ -572,8 +584,41 @@ export async function spend(db: D1Database, input: SpendInput): Promise<SpendRes
     }
   }
 
+  // 1a. Parent cascade: a delegated spend also counts against the parent's
+  // daily limit, so a parent cannot dodge its cap by delegating. Tracked even
+  // when the parent has no limit (NULL still increments the counter).
+  if (input.agent && parentId) {
+    const parentBump = await db
+      .prepare(
+        "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_day = ? THEN spent_today_cents + ? ELSE ? END, spent_day = ?, last_used_at = ? WHERE id = ? AND active = 1 AND (daily_limit_cents IS NULL OR (CASE WHEN spent_day = ? THEN spent_today_cents ELSE 0 END) + ? <= daily_limit_cents)",
+      )
+      .bind(day, amountCents, amountCents, day, nowIso(), parentId, day, amountCents)
+      .run();
+    if ((parentBump.meta?.changes ?? 0) !== 1) {
+      await db
+        .prepare(
+          "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_today_cents >= ? THEN spent_today_cents - ? ELSE 0 END WHERE id = ?",
+        )
+        .bind(amountCents, amountCents, input.agent.id)
+        .run();
+      const parent = await db
+        .prepare("SELECT name, daily_limit_cents FROM ap_agents WHERE id = ?")
+        .bind(parentId)
+        .first<{ name: string; daily_limit_cents: number | null }>();
+      throw new HttpError(
+        402,
+        `Daily limit would be exceeded for parent agent "${parent?.name ?? "parent"}" (limit ${formatCents(parent?.daily_limit_cents ?? 0)}/day, includes sub-agent spend)`,
+        {
+          code: "parent_daily_limit",
+          parentAgentId: parentId,
+          parentDailyLimitCents: parent?.daily_limit_cents ?? null,
+        },
+      );
+    }
+  }
+
   // 1b. Sub-agent lifetime budget (guarded UPDATE) — only for delegated keys.
-  if (input.agent?.parent_agent_id) {
+  if (input.agent && parentId) {
     const budget = await db
       .prepare(
         "UPDATE ap_subagent_budgets SET spent_cents = spent_cents + ?, updated_at = ? WHERE agent_id = ? AND (budget_cents IS NULL OR spent_cents + ? <= budget_cents) AND (expires_at IS NULL OR expires_at > ?)",
@@ -586,6 +631,12 @@ export async function spend(db: D1Database, input: SpendInput): Promise<SpendRes
           "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_today_cents >= ? THEN spent_today_cents - ? ELSE 0 END WHERE id = ?",
         )
         .bind(amountCents, amountCents, input.agent.id)
+        .run();
+      await db
+        .prepare(
+          "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_today_cents >= ? THEN spent_today_cents - ? ELSE 0 END WHERE id = ?",
+        )
+        .bind(amountCents, amountCents, parentId)
         .run();
       throw new HttpError(402, "Sub-agent budget exhausted or key expired — ask the parent agent for a new one", {
         code: "subagent_budget",
@@ -608,7 +659,13 @@ export async function spend(db: D1Database, input: SpendInput): Promise<SpendRes
         )
         .bind(amountCents, amountCents, input.agent.id)
         .run();
-      if (input.agent.parent_agent_id) {
+      if (parentId) {
+        await db
+          .prepare(
+            "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_today_cents >= ? THEN spent_today_cents - ? ELSE 0 END WHERE id = ?",
+          )
+          .bind(amountCents, amountCents, parentId)
+          .run();
         await db
           .prepare(
             "UPDATE ap_subagent_budgets SET spent_cents = CASE WHEN spent_cents >= ? THEN spent_cents - ? ELSE 0 END, updated_at = ? WHERE agent_id = ?",
@@ -727,6 +784,20 @@ export async function refundSpend(
       )
       .bind(amountCents, amountCents, nowIso(), input.agentId)
       .run();
+    // Unwind the parent cascade: a delegated spend counted against the parent,
+    // so the refund must restore it too.
+    const link = await db
+      .prepare("SELECT parent_agent_id FROM ap_subagent_budgets WHERE agent_id = ?")
+      .bind(input.agentId)
+      .first<{ parent_agent_id: string }>();
+    if (link?.parent_agent_id) {
+      await db
+        .prepare(
+          "UPDATE ap_agents SET spent_today_cents = CASE WHEN spent_today_cents >= ? THEN spent_today_cents - ? ELSE 0 END WHERE id = ?",
+        )
+        .bind(amountCents, amountCents, link.parent_agent_id)
+        .run();
+    }
   }
 
   const balanceCents = await getBalanceCents(db, input.walletId);

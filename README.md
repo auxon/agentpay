@@ -357,5 +357,5 @@ analytics), use the [x402 Gateway](https://entangleit.com/x402gateway/).
 
 - Multi-rail settlement beyond BSV (for sellers that advertise other x402 networks).
 - Key expiry + rotation schedules for top-level agents (children already expire).
-- Cascading budgets: let a parent's daily limit account for its sub-agents' spend.
+- ~~Cascading budgets: let a parent's daily limit account for its sub-agents' spend.~~ Shipped 2026-10-11: every sub-agent spend also bumps the parent's `spent_today_cents` (guarded, fails `parent_daily_limit`), refund unwinds it.
 - Nested delegation (sub-agents minting sub-agents) with intersected scopes.

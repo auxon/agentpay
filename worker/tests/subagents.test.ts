@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { makeTestDb } from "./helpers";
-import { createAgent, createSubagent, creditTopup, listAgents, listSubagents, refundSpend, revokeAgent, spend } from "../src/ledger";
+import { createAgent, createSubagent, createWallet, creditTopup, getBalanceCents, listAgents, listSubagents, refundSpend, revokeAgent, spend } from "../src/ledger";
 import { requireAgent } from "../src/auth";
 import type { AgentRow, HttpError } from "../src/types";
 
@@ -137,5 +137,99 @@ describe("sub-agent budgets", () => {
     expect(agentToolAllowed(allowed, "svc_b", "ocr")).toBe(false);
     const auth = await requireAgent(requestWith(key), db);
     expect(auth.agent.id).toBe(agent.id);
+  });
+});
+
+describe("cascading budgets (parent daily limit includes sub-agent spend)", () => {
+  async function makeWalletWithLimitedParent(parentLimitCents: number | null) {
+    const db = makeTestDb();
+    const { wallet } = await createWallet(db, { name: "Cascader" });
+    const { agent: parent } = await createAgent(db, wallet.id, {
+      name: "orchestrator",
+      dailyLimitCents: parentLimitCents,
+    });
+    await creditTopup(db, { walletId: wallet.id, amountCents: 5000, ref: `cs_cascade_${Date.now()}_${Math.random()}` });
+    return { db, wallet, parent };
+  }
+
+  async function parentCounter(db: ReturnType<typeof makeTestDb>, parentId: string) {
+    const row = await db
+      .prepare("SELECT spent_today_cents FROM ap_agents WHERE id = ?")
+      .bind(parentId)
+      .first<{ spent_today_cents: number }>();
+    return row?.spent_today_cents ?? 0;
+  }
+
+  it("counts child spend against the parent counter even when the parent is unlimited", async () => {
+    const { db, wallet, parent } = await makeWalletWithParent();
+    const { agent: child } = await createSubagent(db, parent, { name: "worker", budgetCents: 1000 });
+    await spend(db, { walletId: wallet.id, agent: child, amountCents: 300, description: "delegated work" });
+    expect(await parentCounter(db, parent.id)).toBe(300);
+    const kids = await listSubagents(db, parent.id);
+    expect(kids[0].sub_spent_cents).toBe(300);
+  });
+
+  it("blocks child spend when the parent cap would be exceeded", async () => {
+    const { db, wallet, parent } = await makeWalletWithLimitedParent(300);
+    const { agent: child } = await createSubagent(db, parent, { name: "worker", budgetCents: 1000 });
+    await spend(db, { walletId: wallet.id, agent: child, amountCents: 200, description: "first chunk" });
+    expect(await parentCounter(db, parent.id)).toBe(200);
+
+    const err = await catchHttp(
+      spend(db, { walletId: wallet.id, agent: child, amountCents: 150, description: "over parent cap" }),
+    );
+    expect(err.status).toBe(402);
+    expect(err.payload?.code).toBe("parent_daily_limit");
+
+    // Failed spend touches nothing: wallet, child counter, parent counter, budget.
+    expect(await getBalanceCents(db, wallet.id)).toBe(4800);
+    expect(await parentCounter(db, parent.id)).toBe(200);
+    const kids = await listSubagents(db, parent.id);
+    expect(kids[0].sub_spent_cents).toBe(200);
+    const childRow = await db
+      .prepare("SELECT spent_today_cents FROM ap_agents WHERE id = ?")
+      .bind(child.id)
+      .first<{ spent_today_cents: number }>();
+    expect(childRow?.spent_today_cents).toBe(200);
+  });
+
+  it("shares one cap between parent direct spend and delegated spend", async () => {
+    const { db, wallet, parent } = await makeWalletWithLimitedParent(300);
+    const { agent: child } = await createSubagent(db, parent, { name: "worker", budgetCents: 1000 });
+    // Parent spends directly first. Re-fetch so the row carries today's counter.
+    const { listAgents } = await import("../src/ledger");
+    const freshParent = (await listAgents(db, wallet.id)).find((a) => a.id === parent.id)!;
+    await spend(db, { walletId: wallet.id, agent: freshParent, amountCents: 200, description: "parent direct" });
+    expect(await parentCounter(db, parent.id)).toBe(200);
+
+    const err = await catchHttp(
+      spend(db, { walletId: wallet.id, agent: child, amountCents: 150, description: "child over shared cap" }),
+    );
+    expect(err.status).toBe(402);
+    expect(err.payload?.code).toBe("parent_daily_limit");
+    expect(await getBalanceCents(db, wallet.id)).toBe(4800);
+  });
+
+  it("restores the parent counter on refund", async () => {
+    const { db, wallet, parent } = await makeWalletWithLimitedParent(1000);
+    const { agent: child } = await createSubagent(db, parent, { name: "worker", budgetCents: 500 });
+    await spend(db, { walletId: wallet.id, agent: child, amountCents: 400, description: "charged" });
+    expect(await parentCounter(db, parent.id)).toBe(400);
+    await refundSpend(db, { walletId: wallet.id, agentId: child.id, amountCents: 400, ref: "refund:cascade" });
+    expect(await parentCounter(db, parent.id)).toBe(0);
+    const kids = await listSubagents(db, parent.id);
+    expect(kids[0].sub_spent_cents).toBe(0);
+  });
+
+  it("cascades even when the caller passes a bare agent row without parent_agent_id", async () => {
+    const { db, wallet, parent } = await makeWalletWithParent();
+    const { agent: child } = await createSubagent(db, parent, { name: "worker", budgetCents: 1000 });
+    const bare = await db
+      .prepare("SELECT * FROM ap_agents WHERE id = ?")
+      .bind(child.id)
+      .first<AgentRow>();
+    expect(bare?.parent_agent_id).toBeUndefined();
+    await spend(db, { walletId: wallet.id, agent: bare!, amountCents: 250, description: "bare row spend" });
+    expect(await parentCounter(db, parent.id)).toBe(250);
   });
 });
