@@ -22,6 +22,14 @@ database_id = "8f6c1ac7-ab0c-4133-a037-6ac1ed6afa6e"
 binding = "BOUNTIES"
 service = "bsv-bounties"
 
+# Fuse chat completions. The binding bypasses same-zone route caveats:
+# fetch("https://entangleit.com/fuse/...") from this worker hits origin (405).
+# Request URL on the binding stays the public path so x402 resource fields
+# (and receipts) still point at entangleit.com. FUSE_CHAT_URL is fetch fallback.
+[[services]]
+binding = "FUSE"
+service = "fuse"
+
 [vars]
 APP_ORIGIN = "https://entangleit.com"
 # Plans: every wallet starts Free; Pro is a monthly Stripe subscription.
@@ -52,8 +60,9 @@ TRUST_GATE_PAY = "log"
 TRIAL_ENABLED = "1"
 # TRIAL_CENTS = "50"
 # TRIAL_TOTAL_CAP_CENTS = "1000"
-# Optional Fuse chat completions URL (pay-per-call LLM, no API key).
-# FUSE_CHAT_URL = "https://entangleit.com/fuse/v1/chat/completions"
+# Optional Fuse chat completions URL — fetch fallback when the FUSE binding
+# is absent (local / tests). Production should use the service binding.
+# FUSE_CHAT_URL = "https://fuse.richard-hein.workers.dev/fuse/v1/chat/completions"
 # Google sign-in for the dashboard (GIS ID-token flow). Create an OAuth 2.0
 # Client ID in Google Cloud Console; no client secret needed.
 # wrangler secret put GOOGLE_CLIENT_ID   (or set as a plain var)

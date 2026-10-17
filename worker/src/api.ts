@@ -108,9 +108,10 @@ import { callServiceTool, getService, listServices, quoteService, registryAvaila
 import {
   FUSE_DOCS_URL,
   FUSE_MODELS,
+  FUSE_PUBLIC_CHAT_URL,
   FUSE_SERVICE_ID,
   callFuseChat,
-  fuseChatUrl,
+  fuseBindingConfigured,
   parseFuseChatBody,
   quoteFuseChat,
 } from "./fuse";
@@ -533,7 +534,8 @@ api.get("/health", async (c) => {
       treasury,
     },
     fuse: {
-      chat: fuseChatUrl(env),
+      chat: FUSE_PUBLIC_CHAT_URL,
+      binding: fuseBindingConfigured(env),
       models: [...FUSE_MODELS],
       docs: FUSE_DOCS_URL,
     },
@@ -1691,12 +1693,11 @@ api.post("/agent/chat", async (c) => {
     dryRun?: unknown;
   };
   const chat = parseFuseChatBody(body);
-  const url = fuseChatUrl(c.env);
   const description = cleanStr(body.description, 200) || `chat ${chat.model}`;
   const ref = cleanStr(body.ref, 120);
   const approvalId = cleanStr(body.approvalId, 80);
 
-  const quote = await quoteFuseChat(url, chat);
+  const quote = await quoteFuseChat(c.env, chat);
   const requirements = quote.requirements;
   const { resolveSatsPerCent } = await import("./price");
   const quoteRate = await resolveSatsPerCent(
@@ -1765,7 +1766,7 @@ api.post("/agent/chat", async (c) => {
 
     let res: Response;
     try {
-      res = await callFuseChat(url, chat, prepared.paymentSignature);
+      res = await callFuseChat(c.env, chat, prepared.paymentSignature);
     } catch (e) {
       await refundSpend(c.env.DB, {
         walletId: wallet.id,

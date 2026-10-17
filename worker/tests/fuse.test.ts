@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PrivateKey } from "@bsv/sdk";
 import { api } from "../src/api";
 import { createAgent, createWallet, creditTopup, setAgentPolicy } from "../src/ledger";
-import { FUSE_DEFAULT_MODEL, parseFuseChatBody, parseFuseModel } from "../src/fuse";
+import {
+  FUSE_DEFAULT_MODEL,
+  FUSE_PUBLIC_CHAT_URL,
+  parseFuseChatBody,
+  parseFuseModel,
+  publicizeFuseChallenge,
+  quoteFuseChat,
+} from "../src/fuse";
 import { BSV_NETWORK } from "../src/x402";
 import { HttpError, type AppEnv } from "../src/types";
 import { makeTestDb, type TestDb } from "./helpers";
@@ -114,6 +121,67 @@ function stubNetwork(opts: { fusePaid?: Record<string, unknown>; fuseStatus?: nu
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+function fuse402Response(resourceUrl?: string): Response {
+  const challenge = fuseChallenge();
+  if (resourceUrl) (challenge.resource as { url: string }).url = resourceUrl;
+  return new Response(JSON.stringify(challenge), {
+    status: 402,
+    headers: { "content-type": "application/json", "PAYMENT-REQUIRED": b64json(challenge) },
+  });
+}
+
+describe("Fuse transport", () => {
+  const ping = { model: "fuse-fast" as const, messages: [{ role: "user" as const, content: "ping" }] };
+
+  it("rewrites x402 resource.url to the public hostname", () => {
+    const raw = publicizeFuseChallenge({
+      x402Version: 2,
+      resource: { url: "https://fuse.richard-hein.workers.dev/fuse/v1/chat/completions", description: "Fuse Fast" },
+      accepts: [],
+    }) as { resource: { url: string; description: string } };
+    expect(raw.resource.url).toBe(FUSE_PUBLIC_CHAT_URL);
+    expect(raw.resource.description).toBe("Fuse Fast");
+  });
+
+  it("calls the FUSE service binding with the public chat URL and skips fetch", async () => {
+    const seen: string[] = [];
+    const env = {
+      FUSE: {
+        fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+          const req = input instanceof Request ? input : new Request(String(input), init);
+          seen.push(req.url);
+          expect(req.method).toBe("POST");
+          expect(req.headers.get("content-type")).toMatch(/json/);
+          return fuse402Response("https://fuse.richard-hein.workers.dev/fuse/v1/chat/completions");
+        },
+      },
+    } as AppEnv;
+    const fetchSpy = vi.fn(async () => new Response("should not run", { status: 500 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const quote = await quoteFuseChat(env, ping);
+    expect(seen).toEqual([FUSE_PUBLIC_CHAT_URL]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(quote.url).toBe(FUSE_PUBLIC_CHAT_URL);
+    expect(quote.requirements.resourceUrl).toBe(FUSE_PUBLIC_CHAT_URL);
+    expect((quote.raw as { resource: { url: string } }).resource.url).toBe(FUSE_PUBLIC_CHAT_URL);
+  });
+
+  it("falls back to FUSE_CHAT_URL fetch when the binding is absent", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      seen.push(url);
+      const req = new Request(url, init);
+      expect(req.method).toBe("POST");
+      return fuse402Response("https://fuse.richard-hein.workers.dev/v1/chat/completions");
+    });
+    const quote = await quoteFuseChat({ FUSE_CHAT_URL: FUSE_URL } as AppEnv, ping);
+    expect(seen).toEqual([FUSE_URL]);
+    expect(quote.url).toBe(FUSE_PUBLIC_CHAT_URL);
+    expect(quote.requirements.resourceUrl).toBe(FUSE_PUBLIC_CHAT_URL);
+  });
 });
 
 describe("Fuse chat input", () => {
@@ -242,6 +310,43 @@ describe("POST /agent/chat", () => {
     );
     expect(status).toBe(403);
     expect(String(body.error)).toMatch(/allowlist/);
+  });
+
+  it("pays Fuse through the service binding using the public request URL", async () => {
+    const db = makeTestDb();
+    const { key } = await fundedAgent(db);
+    const { wif } = stubNetwork();
+    const fuseCalls: string[] = [];
+    const FUSE = {
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(String(input), init);
+        fuseCalls.push(req.url);
+        const sig = req.headers.get("PAYMENT-SIGNATURE");
+        if (!sig) return fuse402Response();
+        return new Response(
+          JSON.stringify({ id: "chatcmpl_bind", choices: [{ message: { role: "assistant", content: "pong" } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    };
+    const { status, body } = await jsonOf(
+      await req(
+        "/api/agentpay/agent/chat",
+        db,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "fuse-fast",
+            messages: [{ role: "user", content: "ping" }],
+          }),
+        },
+        { SITE_WALLET_WIF: wif, FUSE: FUSE as Fetcher },
+      ),
+    );
+    expect(status).toBe(200);
+    expect(body.text).toBe("pong");
+    expect(fuseCalls).toEqual([FUSE_PUBLIC_CHAT_URL, FUSE_PUBLIC_CHAT_URL]);
   });
 
   it("rejects an unknown model before contacting Fuse", async () => {
