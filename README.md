@@ -158,11 +158,14 @@ daily counter. Free tools are called straight through with no debit.
 
 **Pay-per-call LLM, no API key.** MCP tool `chat` / `POST /agent/chat` calls
 [Fuse](https://entangleit.com/fuse/pay) chat completions
-(`https://entangleit.com/fuse/v1/chat/completions`). Fuse answers unpaid requests
-with a standard v2 402; agentpay pays it from the site wallet and returns the
-completion plus `receiptUrl` and `txid`. Models: `fuse-fast` (500 sats),
-`fuse-smart` (2500 sats). Wallet limits, scoped keys (`chat` / `fuse:*` /
-`fuse:<model>`), and `claim_trial` budgets apply. Discovery:
+(`https://entangleit.com/fuse/v1/chat/completions`) through the `FUSE` service
+binding (same-zone `fetch` to that URL 405s at origin). The public URL is kept
+on the x402 resource/receipt so explorers and receipts still link to
+entangleit.com. Without the binding, `FUSE_CHAT_URL` is fetched instead. Fuse
+answers unpaid requests with a standard v2 402; agentpay pays it from the site
+wallet and returns the completion plus `receiptUrl` and `txid`. Models:
+`fuse-fast` (500 sats), `fuse-smart` (2500 sats). Wallet limits, scoped keys
+(`chat` / `fuse:*` / `fuse:<model>`), and `claim_trial` budgets apply. Discovery:
 `https://entangleit.com/fuse/.well-known/x402`.
 
 Rail hardening (learned from live mainnet tests):
@@ -191,7 +194,8 @@ npx wrangler secret put SITE_WALLET_WIF   # BSV treasury (same model as Brainsto
 | `X402_SATS_PER_CENT` | unset | Auto-pricing; unset charges the 1-cent minimum per paid call. |
 | `X402_MIN_TREASURY_SATS` | `5000` | `/health` flags `x402.treasury.low` below this balance. |
 | `X402_ALLOW_UNCONFIRMED` | unset | `1` spends unconfirmed UTXOs (local testing only). |
-| `FUSE_CHAT_URL` | Fuse prod completions | Override the pay-per-call LLM endpoint (tests). |
+| `FUSE` (service binding) | worker `fuse` | Same-zone Worker-to-Worker chat calls (avoids origin 405). |
+| `FUSE_CHAT_URL` | public completions URL | Fetch fallback when the FUSE binding is absent (local / tests). |
 | `TRIAL_CENTS` | `50` | Trial faucet credit. 50¢ ≈ 50 fuse-fast calls at the 1-cent floor (was 25¢). |
 
 Without `SITE_WALLET_WIF`, `pay_service` falls back to internal wallet settlement
