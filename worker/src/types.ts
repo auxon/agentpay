@@ -74,8 +74,10 @@ export interface AppEnv {
   GOOGLE_CLIENT_ID?: string;
   /** Trial faucet: TRIAL_ENABLED="1" gates POST /trial + claim_trial. */
   TRIAL_ENABLED?: string;
-  /** Trial wallet funding in cents (default 25, max 500). */
+  /** Trial wallet funding in cents (default 50, max 500). 50¢ ≈ 50 fuse-fast calls at the 1-cent floor. */
   TRIAL_CENTS?: string;
+  /** Fuse pay-per-call chat completions URL (default https://entangleit.com/fuse/v1/chat/completions). */
+  FUSE_CHAT_URL?: string;
   /** Operator lifetime trial budget in cents (default 1000 = $10). */
   TRIAL_TOTAL_CAP_CENTS?: string;
   /** Monthly Pro price in USD cents (default 2900). */

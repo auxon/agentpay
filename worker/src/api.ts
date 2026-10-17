@@ -23,6 +23,7 @@ import {
 } from "./types";
 import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
+  agentChatAllowed,
   agentSpendAllowed,
   agentToolAllowed,
   claimX402Txid,
@@ -104,6 +105,15 @@ import {
   type Attestation,
 } from "./attestations";
 import { callServiceTool, getService, listServices, quoteService, registryAvailable } from "./registry";
+import {
+  FUSE_DOCS_URL,
+  FUSE_MODELS,
+  FUSE_SERVICE_ID,
+  callFuseChat,
+  fuseChatUrl,
+  parseFuseChatBody,
+  quoteFuseChat,
+} from "./fuse";
 import { applyTrustMultiplier, decidePayTrust, fetchReputation, resolveBountyAccount, trustPayMode } from "./trust";
 import { getCachedBsvUsd } from "./price";
 import {
@@ -345,7 +355,11 @@ async function gateSpend(
 ): Promise<GateResult> {
   const policy = await getAgentPolicy(c.env.DB, input.agent.id);
   const allowed = parseAllowedTools(policy.allowed_tools_json);
-  if (input.serviceId && input.toolName) {
+  if (input.serviceId === FUSE_SERVICE_ID) {
+    if (!agentChatAllowed(allowed, input.toolName ?? "chat")) {
+      throw new HttpError(403, `Tool fuse:${input.toolName ?? "chat"} is not in this agent's allowlist`);
+    }
+  } else if (input.serviceId && input.toolName) {
     if (!agentToolAllowed(allowed, input.serviceId, input.toolName)) {
       throw new HttpError(403, `Tool ${input.serviceId}:${input.toolName} is not in this agent's allowlist`);
     }
@@ -518,6 +532,11 @@ api.get("/health", async (c) => {
       maxPaymentSats: maxPaymentSats(env),
       treasury,
     },
+    fuse: {
+      chat: fuseChatUrl(env),
+      models: [...FUSE_MODELS],
+      docs: FUSE_DOCS_URL,
+    },
   });
 });
 
@@ -656,6 +675,7 @@ api.get("/start", async (c) => {
       { n: 4, title: "Mint a bounty account + claim through agentpay", tool: "claim_bounty", body: { bountyId: "<id>", workerAccount: "<your #N>", workerPubKey: "<your key>" }, note: "Claiming through agentpay links wallet↔account for payouts, reputation fast-path, and bond discount" },
       { n: 5, title: "Dry-run a paid call (no charge)", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", dryRun: true }, note: "Returns quote + would-be charge + trust evaluation without debiting" },
       { n: 6, title: "Spend for real", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", params: {} } },
+      { n: 7, title: "Pay-per-call LLM (no API key)", tool: "chat", body: { model: "fuse-fast", messages: [{ role: "user", content: "ping" }] }, note: "Settles Fuse's standard x402 v2 402 from the wallet; returns the completion + txid" },
     ],
     mcp: `${PUBLIC_SITE}${MCP_PATH}`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
@@ -666,10 +686,10 @@ api.get("/start", async (c) => {
 
 /** Machine-readable agent card: MCP endpoint, tools, registry, trust rails. */
 api.get("/agent-card", async (c) => {
-  const { MCP_TOOLS } = await import("./mcp");
+  const { MCP_TOOLS, MCP_VERSION } = await import("./mcp");
   return c.json({
     name: "agentpay",
-    version: "0.1.0",
+    version: MCP_VERSION,
     site: `${PUBLIC_SITE}/agentpay/`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
     mcp: { endpoint: `${PUBLIC_SITE}${MCP_PATH}`, transport: "streamable-http", auth: "Bearer agp_… (header or per-tool key)" },
@@ -685,6 +705,7 @@ api.get("/agent-card", async (c) => {
       reputationFastPath: "pay_service {bountyAccount} → approval threshold x2 when score>=650",
       bondDiscount: "claim_bounty {attestation, attestationSignature} → 50% worker bond off when eligible",
       sandbox: "pay_service {dryRun:true} → quote + policy check, no charge",
+      chat: "chat {model, messages} → pay-per-call Fuse LLM, no API key, receipt + txid",
     },
     starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
   });
@@ -715,6 +736,7 @@ api.get("/connect", async (c) => {
     },
     firstTool: "onboard",
     skill: `${PUBLIC_SITE}${API_PREFIX}/skill`,
+    llms: `${PUBLIC_SITE}${API_PREFIX}/llms.txt`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
     starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
   });
@@ -737,6 +759,14 @@ api.get("/skill", async (c) => {
   const { AGENTPAY_SKILL_MD } = await import("./skill");
   return new Response(AGENTPAY_SKILL_MD, {
     headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "public, max-age=3600" },
+  });
+});
+
+/** Short machine-readable index for agent crawlers (llms.txt). */
+api.get("/llms.txt", async (c) => {
+  const { AGENTPAY_LLMS_TXT } = await import("./skill");
+  return new Response(AGENTPAY_LLMS_TXT, {
+    headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=3600" },
   });
 });
 
@@ -1639,6 +1669,229 @@ api.post("/agent/pay-service", async (c) => {
     settlement: "wallet",
     note: "Site wallet WIF is not configured, so no on-chain payment was made. Configure SITE_WALLET_WIF to settle x402 challenges.",
     trust,
+  });
+});
+
+/**
+ * Pay-per-call Fuse LLM. Quotes the standard x402 v2 402, settles BSV from
+ * the site wallet, debits the agent wallet (limits / allowlist / approvals
+ * still apply), and returns the completion plus receipt + txid. No Fuse key.
+ */
+api.post("/agent/chat", async (c) => {
+  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    model?: unknown;
+    messages?: unknown;
+    max_tokens?: unknown;
+    maxTokens?: unknown;
+    amountCents?: unknown;
+    description?: unknown;
+    ref?: unknown;
+    approvalId?: unknown;
+    dryRun?: unknown;
+  };
+  const chat = parseFuseChatBody(body);
+  const url = fuseChatUrl(c.env);
+  const description = cleanStr(body.description, 200) || `chat ${chat.model}`;
+  const ref = cleanStr(body.ref, 120);
+  const approvalId = cleanStr(body.approvalId, 80);
+
+  const quote = await quoteFuseChat(url, chat);
+  const requirements = quote.requirements;
+  const { resolveSatsPerCent } = await import("./price");
+  const quoteRate = await resolveSatsPerCent(
+    c.env,
+    c.env.DB,
+    Number(String(c.env.X402_SATS_PER_CENT ?? "")) || 0 || 40_000,
+  );
+  const amountCents = chargeCentsFor(requirements.satoshis, c.env, body.amountCents, quoteRate.perCent);
+
+  if (body.dryRun === true) {
+    return c.json({
+      dryRun: true,
+      model: chat.model,
+      satoshis: requirements.satoshis,
+      payTo: requirements.payTo,
+      chargedCents: amountCents,
+      quote: quote.raw,
+      note: "Dry run — nothing was debited or settled. Omit dryRun to execute.",
+    });
+  }
+
+  const gate = await gateSpend(c, {
+    wallet,
+    agent,
+    amountCents,
+    description,
+    ref,
+    approvalId,
+    serviceId: FUSE_SERVICE_ID,
+    toolName: chat.model,
+    serviceLabel: "fuse",
+    toolLabel: chat.model,
+  });
+  if (gate && "response" in gate) return gate.response;
+
+  if (siteWalletConfigured(c.env)) {
+    const prepared = await prepareBsvPayment(c.env, requirements);
+    if (gate && "consume" in gate) {
+      await consumeGate(c, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        approvalId,
+        amountCents,
+        service: "fuse",
+        tool: chat.model,
+      });
+    }
+    const charged = await spend(c.env.DB, {
+      walletId: wallet.id,
+      agent,
+      amountCents,
+      description,
+      service: "fuse",
+      tool: chat.model,
+      ref,
+      meta: {
+        settlement: "bsv",
+        payTo: requirements.payTo,
+        satoshis: requirements.satoshis,
+        satsPerCent: quoteRate.perCent,
+        priceSource: quoteRate.source,
+        txid: prepared.txid,
+        model: chat.model,
+      },
+    });
+
+    let res: Response;
+    try {
+      res = await callFuseChat(url, chat, prepared.paymentSignature);
+    } catch (e) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: "fuse unreachable",
+        receiptId: charged.receipt.id,
+      });
+      throw e instanceof HttpError
+        ? e
+        : new HttpError(502, `Fuse unreachable after signing payment: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+    }
+
+    const paymentResponse = res.headers.get("PAYMENT-RESPONSE");
+    const fuseReceipt = res.headers.get("X-Fuse-Receipt");
+    const seller = await sellerResponse(res);
+    const settled = seller.status < 400 || Boolean(paymentResponse);
+    if (!settled) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: `fuse rejected (${seller.status})`,
+        receiptId: charged.receipt.id,
+      });
+      throw new HttpError(
+        seller.status === 402 ? 402 : 502,
+        `Fuse rejected x402 payment (${seller.status}): ${seller.body.slice(0, 200)}`,
+      );
+    }
+
+    const claimed = await claimX402Txid(c.env.DB, {
+      txid: prepared.txid,
+      walletId: wallet.id,
+      service: "fuse",
+      tool: chat.model,
+      receiptId: charged.receipt.id,
+    });
+    if (!claimed) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: "duplicate x402 txid (seller replay)",
+        receiptId: charged.receipt.id,
+      });
+      throw new HttpError(502, "Seller returned an already-settled txid — the debit was refunded");
+    }
+
+    c.executionCtx.waitUntil(afterSpend(c, wallet, charged));
+    c.executionCtx.waitUntil(
+      treasuryStatus(c.env.DB, c.env)
+        .then((t) => maybeAlertTreasury(c.env, c.env.DB, t))
+        .catch(() => {}),
+    );
+
+    let completion: unknown = null;
+    if (seller.contentType.includes("json") && seller.body) {
+      try {
+        completion = JSON.parse(seller.body) as unknown;
+      } catch {
+        completion = null;
+      }
+    }
+    const receipt = publicReceipt(charged.receipt);
+    return c.json({
+      completion,
+      text:
+        completion && typeof completion === "object"
+          ? String(
+              (completion as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message
+                ?.content ?? "",
+            ) || null
+          : null,
+      receipt,
+      receiptUrl: `${PUBLIC_SITE}${API_PREFIX}/agent/receipts/${receipt.id}`,
+      receiptPage: `${PUBLIC_SITE}${APP_PREFIX}/`,
+      balanceCents: charged.balanceCents,
+      agentSpentTodayCents: charged.agentSpentTodayCents,
+      settlement: "bsv",
+      network: "bsv:mainnet",
+      txid: prepared.txid,
+      explorerUrl: `https://whatsonchain.com/tx/${prepared.txid}`,
+      satoshis: requirements.satoshis,
+      payTo: requirements.payTo,
+      chargedCents: amountCents,
+      model: chat.model,
+      fuseReceipt: fuseReceipt || null,
+      paymentResponse: paymentResponse ? safeParseB64(paymentResponse) : null,
+    });
+  }
+
+  if (gate && "consume" in gate) {
+    await consumeGate(c, {
+      walletId: wallet.id,
+      agentId: agent.id,
+      approvalId,
+      amountCents,
+      service: "fuse",
+      tool: chat.model,
+    });
+  }
+  const result = await spend(c.env.DB, {
+    walletId: wallet.id,
+    agent,
+    amountCents,
+    description,
+    service: "fuse",
+    tool: chat.model,
+    ref,
+    meta: { settlement: "wallet", satoshis: requirements.satoshis, model: chat.model },
+  });
+  c.executionCtx.waitUntil(afterSpend(c, wallet, result));
+  return c.json({
+    receipt: publicReceipt(result.receipt),
+    receiptUrl: `${PUBLIC_SITE}${API_PREFIX}/agent/receipts/${result.receipt.id}`,
+    balanceCents: result.balanceCents,
+    agentSpentTodayCents: result.agentSpentTodayCents,
+    quote: quote.raw,
+    satoshis: requirements.satoshis,
+    model: chat.model,
+    settlement: "wallet",
+    note: "Site wallet WIF is not configured, so no on-chain payment was made. Configure SITE_WALLET_WIF to settle x402 challenges.",
   });
 });
 

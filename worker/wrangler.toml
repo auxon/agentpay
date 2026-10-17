@@ -47,9 +47,13 @@ X402_MIN_TREASURY_SATS = "5000"
 TRUST_GATE_PAY = "log"
 # Trial faucet (self-serve onboarding): agents mint one pre-funded starter
 # wallet per IP per day. Operator-budget-capped. Live 2026-09-11.
+# Default trial is 50¢ (~50 fuse-fast calls at the 1-cent floor). Override
+# with TRIAL_CENTS if you want a different size; total cap is still $10.
 TRIAL_ENABLED = "1"
-# TRIAL_CENTS = "25"
+# TRIAL_CENTS = "50"
 # TRIAL_TOTAL_CAP_CENTS = "1000"
+# Optional Fuse chat completions URL (pay-per-call LLM, no API key).
+# FUSE_CHAT_URL = "https://entangleit.com/fuse/v1/chat/completions"
 # Google sign-in for the dashboard (GIS ID-token flow). Create an OAuth 2.0
 # Client ID in Google Cloud Console; no client secret needed.
 # wrangler secret put GOOGLE_CLIENT_ID   (or set as a plain var)

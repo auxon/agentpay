@@ -7,6 +7,7 @@ import {
   fetchSiteWalletUtxos,
   maxPaymentSats,
   parseBsvRequirements,
+  paymentSignaturePayload,
   prepareBsvPayment,
   siteWalletAddress,
   treasuryStatus,
@@ -46,6 +47,8 @@ describe("parseBsvRequirements", () => {
       satoshis: 10,
       resourceUrl: "https://seller.test/api/timestamp",
       description: "timestamp",
+      lockingScriptHex: null,
+      accepted: null,
     });
   });
 
@@ -61,6 +64,95 @@ describe("parseBsvRequirements", () => {
     expect(() => parseBsvRequirements(requirements({ payTo: "not-an-address" }))).toThrow(/P2PKH/);
     expect(() => parseBsvRequirements(requirements({ amount: "0", extra: {} }))).toThrow(/satoshi/);
     expect(() => parseBsvRequirements(null)).toThrow(/malformed/);
+  });
+
+  it("accepts a standard x402 v2 accepts[] envelope and ignores non-BSV rails", () => {
+    const locking = "76a914d69d9002e2522e3bf05f31cb7efa1e9562547f5a88ac";
+    const bsvAccept = {
+      scheme: "exact",
+      network: BSV_NETWORK,
+      amount: "500",
+      asset: "BSV",
+      payTo: PAY_TO,
+      maxTimeoutSeconds: 900,
+      extra: {
+        chain: "bsv",
+        unit: "satoshi",
+        lockingScriptHex: locking,
+        perCallSats: 500,
+        payloadFormat: { kind: "p2pkh-rawtx" },
+        model: "fuse-fast",
+      },
+    };
+    const usdcAccept = {
+      scheme: "exact",
+      network: "eip155:8453",
+      amount: "10000",
+      asset: "USDC",
+      payTo: "0x" + "ab".repeat(20),
+    };
+    const parsed = parseBsvRequirements({
+      x402Version: 2,
+      error: "PAYMENT-SIGNATURE header is required",
+      resource: {
+        url: "https://entangleit.com/fuse/v1/chat/completions",
+        description: "Fuse Fast chat completion (500 sats, max 512 tokens)",
+      },
+      accepts: [usdcAccept, bsvAccept],
+    });
+    expect(parsed.payTo).toBe(PAY_TO);
+    expect(parsed.satoshis).toBe(500);
+    expect(parsed.resourceUrl).toBe("https://entangleit.com/fuse/v1/chat/completions");
+    expect(parsed.description).toMatch(/Fuse Fast/);
+    expect(parsed.lockingScriptHex).toBe(locking);
+    expect(parsed.accepted).toMatchObject({ asset: "BSV", amount: "500" });
+  });
+
+  it("prefers extra.perCallSats when extra.satoshis is absent", () => {
+    const parsed = parseBsvRequirements({
+      x402Version: 2,
+      accepts: [
+        {
+          scheme: "exact",
+          network: BSV_NETWORK,
+          amount: "1",
+          asset: "BSV",
+          payTo: PAY_TO,
+          extra: { perCallSats: 2500, payloadFormat: { kind: "p2pkh-rawtx" } },
+        },
+      ],
+    });
+    expect(parsed.satoshis).toBe(2500);
+  });
+
+  it("rejects an accepts[] envelope with only non-BSV rails", () => {
+    expect(() =>
+      parseBsvRequirements({
+        x402Version: 2,
+        accepts: [{ scheme: "exact", network: "base:mainnet", asset: "USDC", payTo: "0xabc", amount: "1" }],
+      }),
+    ).toThrow(/no BSV exact accept/);
+  });
+
+  it("builds a v2 PAYMENT-SIGNATURE that keeps txHex and adds payload.rawtx", () => {
+    const parsed = parseBsvRequirements({
+      x402Version: 2,
+      accepts: [
+        {
+          scheme: "exact",
+          network: BSV_NETWORK,
+          amount: "500",
+          asset: "BSV",
+          payTo: PAY_TO,
+          extra: { lockingScriptHex: "76a914aa".repeat(1) + "88ac", payloadFormat: { kind: "p2pkh-rawtx" } },
+        },
+      ],
+    });
+    const payload = paymentSignaturePayload("deadbeef", parsed);
+    expect(payload.txHex).toBe("deadbeef");
+    expect(payload.encoding).toBe("raw-hex");
+    expect((payload.payload as { rawtx: string }).rawtx).toBe("deadbeef");
+    expect((payload.payload as { lockingScriptHex: string }).lockingScriptHex).toBe(parsed.lockingScriptHex);
   });
 });
 

@@ -15,7 +15,7 @@ import type { AppEnv } from "./types";
 import { TOPUP_MAX_CENTS, TOPUP_MIN_CENTS } from "./stripe";
 
 export const MCP_NAME = "agentpay";
-export const MCP_VERSION = "0.1.0";
+export const MCP_VERSION = "0.2.0";
 
 export const MCP_TOOLS = [
   "health",
@@ -32,6 +32,7 @@ export const MCP_TOOLS = [
   "service_quote",
   "spend",
   "pay_service",
+  "chat",
   "get_receipt",
   "list_transactions",
   "list_bounties",
@@ -45,16 +46,17 @@ export const MCP_TOOLS = [
 ] as const;
 
 export const MCP_INSTRUCTIONS = [
-  "agentpay is a prepaid USD wallet for AI agents on Cloudflare.",
+  "agentpay is a prepaid USD wallet for AI agents on Cloudflare. Pay-per-call LLM with no API key (chat → Fuse), plus x402/BSV payments for registry APIs.",
   "Human dashboard: https://entangleit.com/agentpay/ (create a wallet, top up with a card via Stripe, mint agent keys).",
   "Agents authenticate with a scoped key (agp_…). Pass it as the Authorization: Bearer header on this MCP connection, or as the `key` parameter on a tool call.",
   "New agents call onboard first: it inspects balance, claims, and history, then returns the single next action.",
-  "No key yet: claim_trial mints a pre-funded trial wallet + key (one per IP per day). Full playbook: https://entangleit.com/api/agentpay/skill.",
+  "No key yet: claim_trial mints a pre-funded trial wallet + key (one per IP per day, sized for ~50 fuse-fast calls). Full playbook: https://entangleit.com/api/agentpay/skill · llms.txt: https://entangleit.com/api/agentpay/llms.txt.",
   "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges. claim_trial mints a pre-funded trial wallet + key with no human needed (operator-gated, one per IP per day).",
   "Wallet tools: get_balance, list_transactions, get_receipt.",
-  "Spending: spend debits the wallet and writes a receipt. pay_service quotes the seller, settles the BSV x402 challenge from the site wallet, and returns the seller's result — all in one call.",
+  "LLM: chat {model, messages} calls Fuse chat completions (https://entangleit.com/fuse/v1/chat/completions). No Fuse API key — agentpay pays the standard x402 v2 402 in sats and returns the completion plus receiptUrl and txid. Models: fuse-fast (500 sats) and fuse-smart (2500 sats). Wallet limits, scoped keys, and trial budgets apply.",
+  "Spending: spend debits the wallet and writes a receipt. pay_service quotes a registry seller, settles the BSV x402 challenge (legacy single-object or standard v2 accepts[]) from the site wallet, and returns the seller's result — all in one call.",
   "pay_service takes params (tool arguments) and optional amountCents. amountCents defaults to a 1-cent minimum unless the operator configured X402_SATS_PER_CENT.",
-  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry. approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
+  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry; chat needs \"chat\", \"fuse:*\", or fuse:<model>. approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
   "Plans: wallets start on Free (3 agent keys, daily limits up to $50/agent). Pro ($29/mo) raises that to 25 keys, $1,000/agent daily limits, and CSV export. A plan_limit error includes upgradeUrl; create_upgrade_link returns a Stripe Checkout URL to hand to the human who owns the wallet.",
   "Delegation: a top-level agent can mint_subagent for each worker with its own lifetime budget, expiry, daily limit, and allowlist — then list_subagents and revoke_subagent. Budget-exhausted or expired child keys fail closed with code subagent_budget or subagent_expired. Cascading budgets: every child spend also counts against the parent's daily limit (code parent_daily_limit when the parent cap would be exceeded), so a parent cannot dodge its cap by delegating.",
   "Reputation: get_attestation returns an agentpay-signed summary of the wallet's settled activity. Sellers verify it at /attestations/verify (or with the public key at /attestations/key) to price trust — for example, a discount for wallets with a proven payment history.",
@@ -268,7 +270,7 @@ export function createAgentPayMcpServer(
     {
       title: "Pay a service",
       description:
-        "One call for paid registry tools: quotes the seller's x402 challenge, pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded. Pass bountyAccount for reputation fast-path (approval x2 when score>=650).",
+        "One call for paid registry tools: quotes the seller's x402 challenge (legacy single-object or standard v2 accepts[] — BSV exact only), pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded. For pay-per-call LLM with no API key, use chat instead. Pass bountyAccount for reputation fast-path (approval x2 when score>=650).",
       inputSchema: z.object({
         serviceId: z.string().describe("Registry service id (from list_services)"),
         tool: z.string().describe("Tool name on that service"),
@@ -293,6 +295,45 @@ export function createAgentPayMcpServer(
   );
 
   server.registerTool(
+    "chat",
+    {
+      title: "Pay-per-call LLM",
+      description:
+        "Pay-per-call LLM, no API key. Sends messages to Fuse chat completions; agentpay settles the standard x402 v2 BSV 402 from this wallet and returns the completion plus receiptUrl and txid. Models: fuse-fast (500 sats) or fuse-smart (2500 sats). Wallet limits, scoped keys, and trial budgets apply. Pass dryRun to quote without spending.",
+      inputSchema: z.object({
+        model: z
+          .enum(["fuse-fast", "fuse-smart"])
+          .optional()
+          .describe("Fuse model (default fuse-fast). fuse-fast = 500 sats, fuse-smart = 2500 sats."),
+        messages: z
+          .array(
+            z.object({
+              role: z.enum(["system", "user", "assistant"]),
+              content: z.string().min(1),
+            }),
+          )
+          .min(1)
+          .describe("OpenAI-style chat messages"),
+        max_tokens: z.number().int().min(1).optional(),
+        amountCents: z.number().int().min(1).optional().describe("Override the USD cents charged (min 1 cent default)"),
+        description: z.string().max(200).optional(),
+        ref: z.string().optional(),
+        approvalId: z.string().optional().describe("Approval id from a prior approval_required response"),
+        dryRun: z.boolean().optional().describe("Quote + policy check only, no debit or settlement"),
+        key: keyField,
+      }),
+    },
+    async ({ model, messages, max_tokens, amountCents, description, ref, approvalId, dryRun, key }) => {
+      const { status, json } = await call("POST", "/agent/chat", {
+        key,
+        body: { model, messages, max_tokens, amountCents, description, ref, approvalId, dryRun },
+      });
+      if (status >= 400) return fail(status, json);
+      return ok(json);
+    },
+  );
+
+  server.registerTool(
     "mint_subagent",
     {
       title: "Mint a sub-agent",
@@ -303,7 +344,10 @@ export function createAgentPayMcpServer(
         budgetCents: z.number().int().min(1).optional().describe("Lifetime budget in USD cents (omit for no total cap)"),
         dailyLimitCents: z.number().int().min(1).optional().describe("Per-day limit in USD cents"),
         expiresInMinutes: z.number().int().min(1).max(43200).optional().describe("Key expiry (max 30 days)"),
-        allowedTools: z.array(z.string()).optional().describe("Allowlist entries like serviceId:tool or serviceId:*"),
+        allowedTools: z
+          .array(z.string())
+          .optional()
+          .describe("Allowlist entries like serviceId:tool, serviceId:*, chat, or fuse:fuse-fast"),
         approvalAboveCents: z.number().int().min(1).optional().describe("Human approval threshold in cents"),
         key: keyField,
       }),

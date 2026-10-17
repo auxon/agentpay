@@ -1,9 +1,10 @@
 /**
  * Trial faucet (Phase F) — self-serve $0 onboarding for agents.
  *
- * POST /trial mints a real wallet pre-funded with TRIAL_CENTS (default 25¢)
- * plus a tight agent key, so an agent can make its first paid x402 calls
- * with zero human steps. Abuse controls:
+ * POST /trial mints a real wallet pre-funded with TRIAL_CENTS (default 50¢,
+ * ~50 fuse-fast calls at the 1-cent floor) plus a tight agent key, so an
+ * agent can make its first paid x402 / Fuse chat calls with zero human steps.
+ * Abuse controls:
  * - Operator kill switch: TRIAL_ENABLED must be "1".
  * - One claim per IP per UTC day (UNIQUE(ip_hash, day) — races fail closed).
  * - Operator total budget: TRIAL_TOTAL_CAP_CENTS (default $10), best-effort.
@@ -14,7 +15,8 @@ import { HttpError, type AppEnv } from "./types";
 import { cleanStr, nowIso } from "./ids";
 import { createAgent, createWallet, creditTopup } from "./ledger";
 
-export const TRIAL_DEFAULT_CENTS = 25;
+/** 50¢ covers ~50 fuse-fast calls (500 sats each) at the 1-cent charge floor. */
+export const TRIAL_DEFAULT_CENTS = 50;
 export const TRIAL_DEFAULT_TOTAL_CAP_CENTS = 1000;
 
 export function trialEnabled(env: AppEnv): boolean {
