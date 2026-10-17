@@ -2,10 +2,12 @@
 
 Prepaid USD wallets, budgets, and MCP payment tools for AI agents on Cloudflare.
 A human funds a wallet with a card through Stripe Checkout; agents get scoped
-keys, optional daily limits, and tools to check balance, discover paid services
-(the [x402market](https://entangleit.com/x402market/) registry), spend, and
-fetch receipts. Paid registry calls settle on **BSV mainnet over x402 v2** from
-the operator's site wallet. No browser wallet required.
+keys, optional daily limits, and tools to check balance, call a **pay-per-call
+LLM with no API key** (`chat` → Fuse), discover paid services (the
+[x402market](https://entangleit.com/x402market/) registry), spend, and fetch
+receipts. Paid calls settle on **BSV mainnet over x402 v2** from the operator's
+site wallet (legacy single-object challenges and standard `accepts[]`). No
+browser wallet required.
 
 Live target: `https://entangleit.com/agentpay/` (dashboard) +
 `https://entangleit.com/api/agentpay/*` (worker `agentpay-api`) +
@@ -137,13 +139,31 @@ stripe listen --forward-to localhost:8788/api/agentpay/webhooks/stripe
 ## x402 / BSV rail
 
 `pay_service` is a full x402 v2 **buyer**: it calls the seller unsigned, decodes
-`PAYMENT-REQUIRED` (`bsv:mainnet`, scheme `exact`, asset `native:BSV`), builds and
-signs an exact P2PKH payment from the site wallet (full parent tx attached for ARC
-validation, flat fee), debits the agent wallet, then retries with
-`PAYMENT-SIGNATURE: base64({x402Version, scheme, network, txHex, encoding: "raw-hex"})`.
+`PAYMENT-REQUIRED`, and pays the BSV `exact` rail. Two challenge shapes work:
+
+- **Legacy** (x402market / BSV Wallets): a single object with `network: bsv:mainnet`,
+  scheme `exact`, asset `native:BSV`.
+- **Standard v2** (Fuse and the x402 spec): `{ x402Version: 2, accepts: [...] }`.
+  agentpay chooses the BSV entry (`asset: "BSV"` or `native:BSV`,
+  `payloadFormat.kind: p2pkh-rawtx` when present) and ignores other rails
+  (e.g. Base USDC).
+
+It builds and signs an exact P2PKH payment from the site wallet (full parent tx
+attached for ARC validation, flat fee), debits the agent wallet, then retries
+with `PAYMENT-SIGNATURE: base64({x402Version, scheme, network, txHex, encoding: "raw-hex"})`
+(plus `accepted` + `payload.rawtx` when the challenge was an `accepts[]` entry).
 The seller broadcasts via ARC and returns the resource (and `PAYMENT-RESPONSE`).
 A seller rejection refunds the debit (`refund` ledger row) and unwinds the agent's
 daily counter. Free tools are called straight through with no debit.
+
+**Pay-per-call LLM, no API key.** MCP tool `chat` / `POST /agent/chat` calls
+[Fuse](https://entangleit.com/fuse/pay) chat completions
+(`https://entangleit.com/fuse/v1/chat/completions`). Fuse answers unpaid requests
+with a standard v2 402; agentpay pays it from the site wallet and returns the
+completion plus `receiptUrl` and `txid`. Models: `fuse-fast` (500 sats),
+`fuse-smart` (2500 sats). Wallet limits, scoped keys (`chat` / `fuse:*` /
+`fuse:<model>`), and `claim_trial` budgets apply. Discovery:
+`https://entangleit.com/fuse/.well-known/x402`.
 
 Rail hardening (learned from live mainnet tests):
 
@@ -171,6 +191,8 @@ npx wrangler secret put SITE_WALLET_WIF   # BSV treasury (same model as Brainsto
 | `X402_SATS_PER_CENT` | unset | Auto-pricing; unset charges the 1-cent minimum per paid call. |
 | `X402_MIN_TREASURY_SATS` | `5000` | `/health` flags `x402.treasury.low` below this balance. |
 | `X402_ALLOW_UNCONFIRMED` | unset | `1` spends unconfirmed UTXOs (local testing only). |
+| `FUSE_CHAT_URL` | Fuse prod completions | Override the pay-per-call LLM endpoint (tests). |
+| `TRIAL_CENTS` | `50` | Trial faucet credit. 50¢ ≈ 50 fuse-fast calls at the 1-cent floor (was 25¢). |
 
 Without `SITE_WALLET_WIF`, `pay_service` falls back to internal wallet settlement
 and returns the live quote so a caller can settle out-of-band.
@@ -237,6 +259,8 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 | `POST /agent/spend` | `agp_` | Debit + receipt |
 | `POST /agent/topup-link` | `agp_` | Checkout URL to hand to a human |
 | `POST /agent/pay-service` | `agp_` | Quote, charge, settle x402 on BSV, return seller result |
+| `POST /agent/chat` | `agp_` | Pay-per-call Fuse LLM (no API key); returns completion + receipt + txid |
+| `GET /llms.txt` | — | Short machine-readable agent index |
 | `GET /agent/transactions` · `GET /agent/receipts/:id` | `agp_` | History |
 | `GET /bounties` · `GET /bounties/:id` | — | BSVBounties marketplace listings (proxied) |
 | `POST /bounties/:id/claim` · `POST /bounties/:id/submit` | `agp_` | Claim + submit work, linked to this wallet |
@@ -260,13 +284,13 @@ setup, `GOOGLE_CLIENT_ID` configuration, schema migration, and security notes.
 
 `health` · `get_balance` · `create_topup_link` · `create_upgrade_link` ·
 `mint_subagent` · `list_subagents` · `revoke_subagent` · `get_attestation` ·
-`list_services` · `service_quote` · `spend` · `pay_service` · `get_receipt` ·
+`list_services` · `service_quote` · `spend` · `pay_service` · `chat` · `get_receipt` ·
 `list_transactions` · `list_bounties` · `get_bounty` · `claim_bounty` ·
 `submit_work` · `my_bounties` · `post_bounty` · `settle_bounty` · `my_escrows`
 
 Public tools need no auth. Wallet tools take the agent key as
 `Authorization: Bearer agp_…` on the MCP connection or as the `key` parameter.
-`spend` and `pay_service` accept `approvalId`; when an agent's policy threshold
+`spend`, `pay_service`, and `chat` accept `approvalId`; when an agent's policy threshold
 is crossed they return 402 `approval_required` with an approval URL, and the
 retry settles once a human approves.
 
@@ -292,7 +316,7 @@ Cursor / any MCP client:
 - Every spend = ledger event + receipt; every top-up = ledger event; failed x402 = one refund keyed by receipt id.
 - x402 payloads carry the full v2 envelope; signed txs attach their parent tx; the seller broadcasts via ARC (agentpay never broadcasts).
 - x402 buys only confirmed UTXOs, never reuses a txid (random OP_RETURN nonce), and refunds exactly once per charge (refund keyed by receipt id, replay guard on settled txids).
-- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to both `spend` and `pay_service`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
+- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `pay_service`, and `chat`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
 
 ## Treasury operations
 

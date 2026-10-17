@@ -229,7 +229,7 @@ export default function App() {
           <a className="brand" href="/agentpay/">
             agent<span>pay</span>
           </a>
-          <p className="tagline">Prepaid USD wallets and MCP payment tools for AI agents.</p>
+          <p className="tagline">Prepaid USD wallets, pay-per-call LLM (no API key), and MCP payment tools for AI agents.</p>
         </div>
         {data && (
           <div className="topRight">
@@ -1875,7 +1875,8 @@ function ServicesPanel({ data, onReload }: { data: ServicesResponse | null; onRe
       <p className="muted">
         Live from the <a href="https://entangleit.com/x402market/">x402market</a> registry. Agents discover them
         with the <code>list_services</code> and <code>service_quote</code> MCP tools, then pay with{" "}
-        <code>pay_service</code>.
+        <code>pay_service</code>. For a pay-per-call LLM with no API key, use the{" "}
+        <code>chat</code> tool (Fuse).
       </p>
       {!data.registry && (
         <div className="banner bad">Registry not initialized on this database yet — no listings to show.</div>
@@ -2003,7 +2004,7 @@ function ConnectAgentCard({ onManageKeys }: { onManageKeys: () => void }) {
       <p className="muted">
         agentpay speaks Streamable HTTP MCP. Discovery tools (<code>list_services</code>,{" "}
         <code>service_quote</code>) need no auth; paste an agent key to embed it in every snippet for wallet
-        tools and spending.
+        tools, <code>chat</code> (pay-per-call LLM, no API key), and spending.
       </p>
       <div className="keyRow">
         <input

@@ -336,6 +336,15 @@ export function agentSpendAllowed(allowed: string[]): boolean {
   return allowed.length === 0 || allowed.includes("*") || allowed.includes("spend");
 }
 
+/** Allowlist for the dedicated Fuse `chat` tool. Empty / * = all. */
+export function agentChatAllowed(allowed: string[], model: string): boolean {
+  if (allowed.length === 0) return true;
+  if (allowed.includes("*") || allowed.includes("chat") || allowed.includes("fuse:chat") || allowed.includes("fuse:*")) {
+    return true;
+  }
+  return allowed.includes(`fuse:${model}`);
+}
+
 export async function getAgentPolicy(db: D1Database, agentId: string): Promise<AgentPolicyRow> {
   const row = await db
     .prepare("SELECT * FROM ap_agent_policies WHERE agent_id = ?")

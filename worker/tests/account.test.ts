@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { makeTestDb } from "./helpers";
 import {
+  agentChatAllowed,
   agentSpendAllowed,
   agentToolAllowed,
   claimX402Txid,
@@ -88,6 +89,13 @@ describe("agent policies", () => {
     expect(agentSpendAllowed([])).toBe(true);
     expect(agentSpendAllowed(["s:t"])).toBe(false);
     expect(agentSpendAllowed(["spend"])).toBe(true);
+    expect(agentChatAllowed([], "fuse-fast")).toBe(true);
+    expect(agentChatAllowed(["*"], "fuse-fast")).toBe(true);
+    expect(agentChatAllowed(["chat"], "fuse-fast")).toBe(true);
+    expect(agentChatAllowed(["fuse:*"], "fuse-smart")).toBe(true);
+    expect(agentChatAllowed(["fuse:fuse-fast"], "fuse-fast")).toBe(true);
+    expect(agentChatAllowed(["fuse:fuse-fast"], "fuse-smart")).toBe(false);
+    expect(agentChatAllowed(["s:t"], "fuse-fast")).toBe(false);
   });
 
   it("merges policy updates and validates the threshold", async () => {

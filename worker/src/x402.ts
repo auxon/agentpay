@@ -1,10 +1,16 @@
 /**
  * x402 v2 BSV rail — agentpay as the BUYER.
  *
- * Sellers (e.g. BSV Wallets, Brainstorm) answer unpaid calls with
- * `402 + PAYMENT-REQUIRED: base64(requirements)`. We pay from the site wallet:
- * build + sign an exact P2PKH payment, send it back as
- * `PAYMENT-SIGNATURE: base64({txHex})`, and the seller broadcasts it.
+ * Sellers answer unpaid calls with `402 + PAYMENT-REQUIRED: base64(challenge)`.
+ * Two challenge shapes are accepted:
+ *   1. Legacy single-object (x402market / BSV Wallets): `{ scheme, network,
+ *      payTo, asset: "native:BSV", amount | extra.satoshis }`.
+ *   2. Standard x402 v2 envelope: `{ x402Version: 2, resource, accepts: [...] }`
+ *      — pick the BSV `exact` entry (`network: bsv:mainnet`, asset `BSV` or
+ *      `native:BSV`) and ignore other rails (e.g. Base USDC).
+ *
+ * We pay from the site wallet: build + sign an exact P2PKH payment, send it
+ * back as `PAYMENT-SIGNATURE: base64({txHex, ...})`, and the seller broadcasts.
  *
  * The site wallet is funded by the operator (same treasury model as Brainstorm
  * NFT mints). Agents pay USD cents into the ledger; the rail settles sats.
@@ -15,6 +21,11 @@ import { nowIso } from "./ids";
 
 export const BSV_NETWORK = "bsv:mainnet";
 export const X402_SCHEME = "exact";
+/** Legacy x402market / BSV Wallets asset id. */
+export const BSV_ASSET_LEGACY = "native:BSV";
+/** Standard x402 v2 BSV asset id (Fuse and the x402 spec). */
+export const BSV_ASSET = "BSV";
+export const P2PKH_RAWTX = "p2pkh-rawtx";
 export const DEFAULT_MAX_PAYMENT_SATS = 10_000;
 /** ARC/GorillaPool enforces a relay minimum the SDK fee model undershoots. */
 export const DEFAULT_FEE_SATS = 30;
@@ -27,32 +38,72 @@ export interface BsvRequirements {
   satoshis: number;
   resourceUrl: string | null;
   description: string | null;
+  /** P2PKH locking script from a v2 accept `extra.lockingScriptHex`, when present. */
+  lockingScriptHex?: string | null;
+  /** The chosen `accepts[]` entry (standard v2), so the retry can echo `accepted`. */
+  accepted?: Record<string, unknown> | null;
 }
 
-interface RawRequirements {
+interface RawExtra {
+  satoshis?: unknown;
+  perCallSats?: unknown;
+  lockingScriptHex?: unknown;
+  payloadFormat?: { kind?: unknown } | null;
+}
+
+interface RawAccept {
   scheme?: unknown;
   network?: unknown;
   amount?: unknown;
   payTo?: unknown;
   asset?: unknown;
   resource?: { url?: unknown; description?: unknown } | null;
-  extra?: { satoshis?: unknown } | null;
+  extra?: RawExtra | null;
 }
 
-/** Validate a decoded PAYMENT-REQUIRED payload for the BSV `exact` rail. */
-export function parseBsvRequirements(raw: unknown): BsvRequirements {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new HttpError(502, "Seller returned malformed payment requirements");
-  }
-  const req = raw as RawRequirements;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBsvAsset(asset: unknown): boolean {
+  if (asset === undefined || asset === null || asset === "") return true;
+  return asset === BSV_ASSET || asset === BSV_ASSET_LEGACY;
+}
+
+function payloadKind(extra: RawExtra | null | undefined): string | null {
+  const kind = extra?.payloadFormat?.kind;
+  return typeof kind === "string" && kind ? kind : null;
+}
+
+/** True when an `accepts[]` entry is a BSV exact P2PKH payment we can sign. */
+export function isBsvAccept(entry: unknown): entry is RawAccept {
+  if (!isRecord(entry)) return false;
+  const req = entry as RawAccept;
+  if (req.network !== BSV_NETWORK) return false;
+  if (req.scheme && req.scheme !== X402_SCHEME) return false;
+  if (!isBsvAsset(req.asset)) return false;
+  const kind = payloadKind(req.extra);
+  if (kind && kind !== P2PKH_RAWTX) return false;
+  return true;
+}
+
+function parseOneAccept(
+  req: RawAccept,
+  envelopeResource?: { url?: unknown; description?: unknown } | null,
+  accepted: Record<string, unknown> | null = null,
+): BsvRequirements {
   if (req.network !== BSV_NETWORK) {
     throw new HttpError(502, `Unsupported x402 network "${String(req.network)}" (want ${BSV_NETWORK})`);
   }
-  if (req.asset && req.asset !== "native:BSV") {
-    throw new HttpError(502, `Unsupported x402 asset "${String(req.asset)}" (want native:BSV)`);
+  if (!isBsvAsset(req.asset)) {
+    throw new HttpError(502, `Unsupported x402 asset "${String(req.asset)}" (want ${BSV_ASSET} or ${BSV_ASSET_LEGACY})`);
   }
   if (req.scheme && req.scheme !== X402_SCHEME) {
     throw new HttpError(502, `Unsupported x402 scheme "${String(req.scheme)}" (want ${X402_SCHEME})`);
+  }
+  const kind = payloadKind(req.extra);
+  if (kind && kind !== P2PKH_RAWTX) {
+    throw new HttpError(502, `Unsupported x402 payloadFormat "${kind}" (want ${P2PKH_RAWTX})`);
   }
   const payTo = String(req.payTo ?? "").trim();
   if (!payTo) throw new HttpError(502, "Seller requirements are missing payTo");
@@ -61,16 +112,61 @@ export function parseBsvRequirements(raw: unknown): BsvRequirements {
   } catch {
     throw new HttpError(502, "Seller payTo is not a valid BSV P2PKH address");
   }
-  const satoshis = Number.parseInt(String(req.extra?.satoshis ?? req.amount ?? ""), 10);
+  const satoshis = Number.parseInt(String(req.extra?.satoshis ?? req.extra?.perCallSats ?? req.amount ?? ""), 10);
   if (!Number.isFinite(satoshis) || satoshis <= 0) {
     throw new HttpError(502, "Seller requirements have no payable satoshi amount");
   }
+  const resource = req.resource ?? envelopeResource ?? null;
+  const locking = req.extra?.lockingScriptHex;
   return {
     payTo,
     satoshis,
-    resourceUrl: typeof req.resource?.url === "string" ? req.resource.url : null,
-    description: typeof req.resource?.description === "string" ? req.resource.description : null,
+    resourceUrl: typeof resource?.url === "string" ? resource.url : null,
+    description: typeof resource?.description === "string" ? resource.description : null,
+    lockingScriptHex: typeof locking === "string" && /^[0-9a-f]+$/i.test(locking) ? locking.toLowerCase() : null,
+    accepted,
   };
+}
+
+/**
+ * Validate a decoded PAYMENT-REQUIRED payload for the BSV `exact` rail.
+ * Accepts the legacy single-object challenge and the standard v2 `accepts[]`
+ * envelope (choosing the first payable BSV entry).
+ */
+export function parseBsvRequirements(raw: unknown): BsvRequirements {
+  if (!isRecord(raw)) {
+    throw new HttpError(502, "Seller returned malformed payment requirements");
+  }
+  const envelopeResource = isRecord(raw.resource)
+    ? (raw.resource as { url?: unknown; description?: unknown })
+    : null;
+
+  if (Object.prototype.hasOwnProperty.call(raw, "accepts")) {
+    if (!Array.isArray(raw.accepts)) {
+      throw new HttpError(502, "Seller returned malformed payment requirements");
+    }
+    const bsv = raw.accepts.find(isBsvAccept);
+    if (!bsv) {
+      throw new HttpError(
+        502,
+        `Seller 402 has no BSV exact accept (want ${BSV_NETWORK}, asset ${BSV_ASSET})`,
+      );
+    }
+    return parseOneAccept(bsv, envelopeResource, isRecord(bsv) ? { ...bsv } : null);
+  }
+
+  return parseOneAccept(raw as RawAccept, envelopeResource, null);
+}
+
+/** Decode a PAYMENT-REQUIRED header (standard or URL-safe base64 JSON). */
+export function decodePaymentRequiredHeader(header: string): unknown {
+  const trimmed = header.trim();
+  const b64 = trimmed.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
+  const bin = atob(b64 + pad);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 export function maxPaymentSats(env: AppEnv): number {
@@ -339,6 +435,30 @@ export async function buildBsvPaymentTx(opts: {
   return tx;
 }
 
+/** PAYMENT-SIGNATURE JSON. Always includes txHex for existing sellers; v2
+ *  accepts[] challenges also echo `accepted` and `payload.{rawtx,lockingScriptHex}`. */
+export function paymentSignaturePayload(
+  txHex: string,
+  requirements: BsvRequirements,
+): Record<string, unknown> {
+  const envelope: Record<string, unknown> = {
+    x402Version: 2,
+    scheme: X402_SCHEME,
+    network: BSV_NETWORK,
+    txHex,
+    encoding: "raw-hex",
+  };
+  if (requirements.accepted || requirements.lockingScriptHex) {
+    envelope.accepted = requirements.accepted ?? undefined;
+    envelope.payload = {
+      txHex,
+      rawtx: txHex,
+      ...(requirements.lockingScriptHex ? { lockingScriptHex: requirements.lockingScriptHex } : {}),
+    };
+  }
+  return envelope;
+}
+
 function b64encodeJson(obj: unknown): string {
   const bytes = new TextEncoder().encode(JSON.stringify(obj));
   let bin = "";
@@ -391,13 +511,9 @@ export async function prepareBsvPayment(
   return {
     txid: tx.id("hex"),
     // Strict x402 v2 envelope: the BSV Wallets facilitator rejects bare {txHex}.
-    paymentSignature: b64encodeJson({
-      x402Version: 2,
-      scheme: X402_SCHEME,
-      network: BSV_NETWORK,
-      txHex: tx.toHex(),
-      encoding: "raw-hex",
-    }),
+    // Fuse also accepts this `{txHex}` payload; when the challenge was an
+    // accepts[] entry we echo `accepted` + `payload.rawtx` as well.
+    paymentSignature: b64encodeJson(paymentSignaturePayload(tx.toHex(), requirements)),
     address,
     satoshis: requirements.satoshis,
     // Mirrors the gateway's payer derivation (verifyBsvPayment): binds trust

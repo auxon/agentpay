@@ -2,32 +2,43 @@
  * Published agent skill (Phase F) — a single fetchable playbook so any agent
  * harness can learn agentpay without reading the docs site.
  * Served as text/markdown at GET /api/agentpay/skill. Public, no key.
+ * Short crawler index at GET /api/agentpay/llms.txt.
  */
 export const AGENTPAY_SKILL_MD = `---
 name: agentpay
-description: Prepaid USD wallet for AI agents — spend per-call on x402 APIs, earn from bounties. Use when the task needs paid API calls, a spending balance with limits, or paid work with escrow.
+description: Prepaid USD wallet for AI agents — pay-per-call LLM with no API key, spend per-call on x402 APIs, earn from bounties. Use when the task needs an LLM without an API key, paid API calls, a spending balance with limits, or paid work with escrow.
 ---
 
 # agentpay skill
 
-agentpay gives you a prepaid USD wallet with a scoped key (\`agp_…\`). Humans fund it with a card; you spend per call over x402 on BSV and earn from bounties into the same balance.
+agentpay gives you a prepaid USD wallet with a scoped key (\`agp_…\`). Humans fund it with a card; you spend per call over x402 on BSV (including **pay-per-call LLM, no API key**) and earn from bounties into the same balance.
 
 ## Connect (60 seconds)
 
 MCP (Streamable HTTP): \`https://entangleit.com/api/agentpay/mcp\`
 Auth: \`Authorization: Bearer agp_…\` header, or the \`key\` parameter per tool.
 Copy-paste configs: \`GET https://entangleit.com/api/agentpay/connect\`
-No key yet? \`claim_trial\` mints a pre-funded starter wallet + key (one per IP per day, limited budget). Otherwise hand \`create_topup_link\` output to a human.
+llms.txt: \`https://entangleit.com/api/agentpay/llms.txt\`
+No key yet? \`claim_trial\` mints a pre-funded starter wallet + key (one per IP per day, ~50 fuse-fast calls). Otherwise hand \`create_topup_link\` output to a human.
 
 ## First call: onboard
 
 Call the \`onboard\` tool. It inspects balance, claims, and history, then returns the single next action: earn first, dry-run spend, link identity, or scale.
 
-## Spend
+## Pay-per-call LLM (no API key)
+
+\`chat {model, messages}\` calls Fuse chat completions. agentpay pays the standard x402 v2 402 in sats from this wallet — you never hold a Fuse key.
+
+- \`fuse-fast\` — 500 sats, max 512 tokens (default)
+- \`fuse-smart\` — 2500 sats, max 1024 tokens
+
+Returns the completion, \`receiptUrl\`, and on-chain \`txid\`. Pass \`dryRun: true\` to quote without spending. Wallet limits, scoped-key allowlists (\`chat\`, \`fuse:*\`, or \`fuse:<model>\`), and trial budgets apply.
+
+## Spend (x402 APIs)
 
 1. \`list_services\` — verified x402 services with live prices.
 2. \`service_quote\` — exact price/payTo for one tool (free).
-3. \`pay_service {serviceId, tool, params}\` — quotes, settles on BSV, returns the seller result + txid. Pass \`dryRun: true\` to price without spending.
+3. \`pay_service {serviceId, tool, params}\` — quotes, settles on BSV (legacy single-object *or* standard v2 \`accepts[]\`; BSV exact only), returns the seller result + txid. Pass \`dryRun: true\` to price without spending.
 4. Every debit writes a receipt (\`get_receipt\`, \`list_transactions\`).
 
 Spending rules: scoped keys never withdraw. Daily limits and tool allowlists fail closed. Spends at/above \`approvalAboveCents\` return 402 \`approval_required\` with an approval URL — a human approves, you retry with \`approvalId\`.
@@ -49,4 +60,35 @@ Spending rules: scoped keys never withdraw. Daily limits and tool allowlists fai
 - \`create_topup_link {amountCents}\` — Stripe URL for a human (agents can't pay by card).
 - \`mint_subagent\` — scoped child keys with own budget/expiry/allowlist for fleets.
 - \`post_bounty\` — hire other agents from your balance (escrowed on-chain).
+`;
+
+export const AGENTPAY_LLMS_TXT = `# agentpay
+
+Prepaid USD wallets for AI agents. Pay-per-call LLM, no API key. x402/BSV payments over MCP.
+
+## Endpoints
+
+- Dashboard: https://entangleit.com/agentpay/
+- MCP (Streamable HTTP): https://entangleit.com/api/agentpay/mcp
+- REST: https://entangleit.com/api/agentpay/
+- Skill: https://entangleit.com/api/agentpay/skill
+- Connect configs: https://entangleit.com/api/agentpay/connect
+- This file: https://entangleit.com/api/agentpay/llms.txt
+
+## Auth
+
+Agent key \`agp_…\` as \`Authorization: Bearer\` on the MCP connection or the \`key\` tool parameter.
+No key yet: MCP tool \`claim_trial\` (one pre-funded wallet per IP per day, ~50 fuse-fast calls).
+
+## Pay-per-call LLM (no API key)
+
+MCP tool \`chat\` / REST \`POST /agent/chat\`
+Body: \`{ model, messages }\` (OpenAI-style). Models: \`fuse-fast\` (500 sats), \`fuse-smart\` (2500 sats).
+agentpay settles Fuse's standard x402 v2 402 (\`accepts[]\`, BSV \`exact\`, \`bsv:mainnet\`, asset \`BSV\`) from the site wallet and returns the completion plus \`receiptUrl\` and \`txid\`.
+Fuse: https://entangleit.com/fuse/v1/chat/completions — discovery https://entangleit.com/fuse/.well-known/x402
+
+## Other spend
+
+- \`list_services\` / \`service_quote\` / \`pay_service\` — x402market registry (legacy single-object *and* standard v2 \`accepts[]\` BSV challenges).
+- Wallet limits, scoped keys, and claim_trial budgets are enforced on every debit.
 `;
