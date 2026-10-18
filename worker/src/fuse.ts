@@ -204,3 +204,109 @@ export async function callFuseChat(
 ): Promise<Response> {
   return fuseFetch(env, body, { paymentSignature });
 }
+
+export const FUSE_RETRY_CODES = ["payment_unconfirmed", "empty_completion"] as const;
+export const FUSE_FATAL_CODES = ["payment_double_spend", "payment_orphaned", "payment_rejected"] as const;
+export const FUSE_PAID_ATTEMPTS = 4;
+
+const KNOWN_FUSE_CODES = [...FUSE_RETRY_CODES, ...FUSE_FATAL_CODES];
+
+export type FusePaidOpts = {
+  sleep?: (ms: number) => Promise<void>;
+  maxAttempts?: number;
+};
+
+const defaultPaidSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+let paidSleepOverride: FusePaidOpts["sleep"] | null = null;
+
+/** Test hook so retry tests do not wait on real backoff. */
+export function setFusePaidSleepForTests(fn: FusePaidOpts["sleep"] | null): void {
+  paidSleepOverride = fn;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Pull Fuse's machine error code out of a JSON (or text) body. */
+export function parseFuseErrorCode(status: number, bodyText: string): string | null {
+  const known = KNOWN_FUSE_CODES as readonly string[];
+  const matchKnown = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (known.includes(trimmed)) return trimmed;
+    const hit = known.find((code) => trimmed.includes(code));
+    return hit ?? null;
+  };
+  try {
+    const json = JSON.parse(bodyText) as unknown;
+    if (isRecord(json)) {
+      const nested = isRecord(json.error) ? json.error : null;
+      const candidates: unknown[] = [
+        json.code,
+        json.error,
+        json.error_code,
+        json.reason,
+        json.message,
+        nested?.code,
+        nested?.message,
+        nested?.error,
+      ];
+      for (const c of candidates) {
+        const hit = matchKnown(c);
+        if (hit) return hit;
+      }
+    }
+  } catch {
+    /* not JSON */
+  }
+  const fromText = matchKnown(bodyText);
+  if (fromText) return fromText;
+  if (status === 502 && /empty[_ ]completion/i.test(bodyText)) return "empty_completion";
+  return null;
+}
+
+function rebuildResponse(res: Response, bodyText: string): Response {
+  return new Response(bodyText, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(1_500, 300 * 2 ** attempt);
+}
+
+/**
+ * Paid Fuse call. Resends the SAME PAYMENT-SIGNATURE on `payment_unconfirmed`
+ * and `empty_completion`. `payment_double_spend` / `payment_orphaned` /
+ * `payment_rejected` fail immediately.
+ */
+export async function callFuseChatPaid(
+  env: AppEnv,
+  body: FuseChatRequest,
+  paymentSignature: string,
+  opts: FusePaidOpts = {},
+): Promise<Response> {
+  const sleep = opts.sleep ?? paidSleepOverride ?? defaultPaidSleep;
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? FUSE_PAID_ATTEMPTS);
+  let lastCode: string | null = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const res = await fuseFetch(env, body, { paymentSignature });
+    const text = await res.text().catch(() => "");
+    const rebuilt = rebuildResponse(res, text);
+    if (res.ok) return rebuilt;
+    const code = parseFuseErrorCode(res.status, text);
+    lastCode = code;
+    if (code && (FUSE_FATAL_CODES as readonly string[]).includes(code)) {
+      throw new HttpError(res.status === 402 ? 402 : 502, `Fuse payment failed (${code})`, { code });
+    }
+    const retryable = Boolean(code && (FUSE_RETRY_CODES as readonly string[]).includes(code));
+    if (!retryable) return rebuilt;
+    if (attempt + 1 >= maxAttempts) break;
+    await sleep(retryDelayMs(attempt));
+  }
+  const status = lastCode === "empty_completion" ? 502 : 402;
+  throw new HttpError(
+    status,
+    `Fuse payment failed (${lastCode ?? "retry_exhausted"}) after ${maxAttempts} attempts`,
+    lastCode ? { code: lastCode } : undefined,
+  );
+}

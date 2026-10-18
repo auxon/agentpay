@@ -10,7 +10,10 @@
  *      `native:BSV`) and ignore other rails (e.g. Base USDC).
  *
  * We pay from the site wallet: build + sign an exact P2PKH payment, send it
- * back as `PAYMENT-SIGNATURE: base64({txHex, ...})`, and the seller broadcasts.
+ * back as `PAYMENT-SIGNATURE: base64({txHex, ...})`. We also broadcast EF/BEEF
+ * ourselves (GorillaPool + TAAL + WhatsOnChain) so ARC has the parent before
+ * the seller relays, and we record spent outpoints in D1 so indexer lag cannot
+ * make us double-spend.
  *
  * The site wallet is funded by the operator (same treasury model as Brainstorm
  * NFT mints). Agents pay USD cents into the ledger; the rail settles sats.
@@ -18,6 +21,8 @@
 import { OP, P2PKH, PrivateKey, Script, Transaction, type LockingScript } from "@bsv/sdk";
 import { HttpError, type AppEnv } from "./types";
 import { nowIso } from "./ids";
+import { broadcastPaymentTx, txHexBEEF, txHexEF } from "./broadcast";
+import { filterSpendableUtxos, loadParentTx, recordPaymentCoins } from "./coins";
 
 export const BSV_NETWORK = "bsv:mainnet";
 export const X402_SCHEME = "exact";
@@ -309,7 +314,8 @@ export async function treasuryStatus(db: D1Database, env: AppEnv): Promise<Treas
   }
   try {
     // Spent-filtered read: WOC's /unspent can list outputs our own txs already spent.
-    const utxos = await fetchSiteWalletUtxos(address);
+    const listed = await fetchSiteWalletUtxos(address);
+    const utxos = await filterSpendableUtxos(db, listed, { allowUnconfirmed: true });
     const sats = utxos.reduce((sum, u) => sum + u.value, 0);
     const updatedAt = nowIso();
     await db
@@ -436,10 +442,13 @@ export async function buildBsvPaymentTx(opts: {
 }
 
 /** PAYMENT-SIGNATURE JSON. Always includes txHex for existing sellers; v2
- *  accepts[] challenges also echo `accepted` and `payload.{rawtx,lockingScriptHex}`. */
+ *  accepts[] challenges also echo `accepted` and `payload.{rawtx,lockingScriptHex}`.
+ *  EF/BEEF are extra so a seller/broadcaster that understands them can take the
+ *  parent along; encoding stays raw-hex for compatibility. */
 export function paymentSignaturePayload(
   txHex: string,
   requirements: BsvRequirements,
+  extra?: { txHexEF?: string | null; txHexBEEF?: string | null },
 ): Record<string, unknown> {
   const envelope: Record<string, unknown> = {
     x402Version: 2,
@@ -448,11 +457,15 @@ export function paymentSignaturePayload(
     txHex,
     encoding: "raw-hex",
   };
+  if (extra?.txHexEF) envelope.txHexEF = extra.txHexEF;
+  if (extra?.txHexBEEF) envelope.txHexBEEF = extra.txHexBEEF;
   if (requirements.accepted || requirements.lockingScriptHex) {
     envelope.accepted = requirements.accepted ?? undefined;
     envelope.payload = {
       txHex,
       rawtx: txHex,
+      ...(extra?.txHexEF ? { txHexEF: extra.txHexEF } : {}),
+      ...(extra?.txHexBEEF ? { txHexBEEF: extra.txHexBEEF } : {}),
       ...(requirements.lockingScriptHex ? { lockingScriptHex: requirements.lockingScriptHex } : {}),
     };
   }
@@ -467,8 +480,9 @@ function b64encodeJson(obj: unknown): string {
 }
 
 /**
- * Validate the seller requirements, pick UTXOs, and sign an exact payment.
- * Does NOT broadcast: the seller broadcasts the tx it receives.
+ * Validate the seller requirements, pick UTXOs, sign an exact payment, record
+ * the spent coins, and broadcast EF/BEEF to multiple endpoints. The seller
+ * still receives raw txHex (plus EF/BEEF when we have them).
  */
 export async function prepareBsvPayment(
   env: AppEnv,
@@ -488,10 +502,11 @@ export async function prepareBsvPayment(
   }
   const address = key.toAddress();
   const all = await fetchSiteWalletUtxos(address);
+  const allowUnconfirmed = env.X402_ALLOW_UNCONFIRMED === "1";
   // Spend confirmed UTXOs only: ARC can orphan a child of a just-confirmed
-  // parent it has not indexed yet, and orphans never relay. Opt in to
-  // unconfirmed with X402_ALLOW_UNCONFIRMED=1 for local testing.
-  const utxos = env.X402_ALLOW_UNCONFIRMED === "1" ? all : all.filter((u) => u.height > 0);
+  // parent it has not indexed yet. D1 spent rows win over a lagging indexer.
+  const indexed = allowUnconfirmed ? all : all.filter((u) => u.height > 0);
+  const utxos = env.DB ? await filterSpendableUtxos(env.DB, indexed, { allowUnconfirmed }) : indexed;
   if (utxos.length === 0) {
     const pending = all.filter((u) => u.height === 0).reduce((sum, u) => sum + u.value, 0);
     throw new HttpError(
@@ -503,17 +518,31 @@ export async function prepareBsvPayment(
   }
   const tx = await buildBsvPaymentTx({
     key,
-    utxos,
+    utxos: utxos.map((u) => ({
+      tx_hash: u.tx_hash,
+      tx_pos: u.tx_pos,
+      value: u.value,
+      height: u.height ?? 0,
+    })),
     payTo: requirements.payTo,
     satoshis: requirements.satoshis,
     feeSats: feeSatsFor(env),
+    fetchParent: (txid) => loadParentTx(txid, env.DB, fetchParentTx),
   });
+  if (env.DB) {
+    await recordPaymentCoins(env.DB, tx, address);
+  }
+  await broadcastPaymentTx(env, tx);
+  const raw = tx.toHex();
   return {
     txid: tx.id("hex"),
     // Strict x402 v2 envelope: the BSV Wallets facilitator rejects bare {txHex}.
     // Fuse also accepts this `{txHex}` payload; when the challenge was an
-    // accepts[] entry we echo `accepted` + `payload.rawtx` as well.
-    paymentSignature: b64encodeJson(paymentSignaturePayload(tx.toHex(), requirements)),
+    // accepts[] entry we echo `accepted` + `payload.rawtx` as well. EF/BEEF
+    // travel as extras so a broadcaster can take the parent with the child.
+    paymentSignature: b64encodeJson(
+      paymentSignaturePayload(raw, requirements, { txHexEF: txHexEF(tx), txHexBEEF: txHexBEEF(tx) }),
+    ),
     address,
     satoshis: requirements.satoshis,
     // Mirrors the gateway's payer derivation (verifyBsvPayment): binds trust

@@ -110,7 +110,7 @@ import {
   FUSE_MODELS,
   FUSE_PUBLIC_CHAT_URL,
   FUSE_SERVICE_ID,
-  callFuseChat,
+  callFuseChatPaid,
   fuseBindingConfigured,
   parseFuseChatBody,
   quoteFuseChat,
@@ -1766,7 +1766,7 @@ api.post("/agent/chat", async (c) => {
 
     let res: Response;
     try {
-      res = await callFuseChat(c.env, chat, prepared.paymentSignature);
+      res = await callFuseChatPaid(c.env, chat, prepared.paymentSignature);
     } catch (e) {
       await refundSpend(c.env.DB, {
         walletId: wallet.id,

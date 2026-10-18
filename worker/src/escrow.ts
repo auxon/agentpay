@@ -18,6 +18,7 @@ import {
   isOutputSpent,
   type SiteUtxo,
 } from "./x402";
+import { filterSpendableUtxos, loadParentTx, recordPaymentCoins } from "./coins";
 
 export const DEFAULT_BOUNTY_FEE_BPS = 200; // 2%
 export const ARC_FALLBACK = "https://arc.gorillapool.io/v1";
@@ -231,7 +232,10 @@ export async function buildP2pkhTx(opts: {
 /** Confirmed treasury UTXOs only, mirroring the x402 rail's ARC safety rule. */
 export async function treasuryUtxos(env: AppEnv, address: string): Promise<SiteUtxo[]> {
   const all = await fetchSiteWalletUtxos(address);
-  return env.X402_ALLOW_UNCONFIRMED === "1" ? all : all.filter((u) => (u.height ?? 0) > 0);
+  const allowUnconfirmed = env.X402_ALLOW_UNCONFIRMED === "1";
+  const indexed = allowUnconfirmed ? all : all.filter((u) => (u.height ?? 0) > 0);
+  if (!env.DB) return indexed;
+  return (await filterSpendableUtxos(env.DB, indexed, { allowUnconfirmed })) as SiteUtxo[];
 }
 
 /** Treasury → escrow P2PKH output, with an audit marker OP_RETURN. */
@@ -247,13 +251,16 @@ export async function buildEscrowFundingTx(opts: {
   if (utxos.length === 0) {
     throw new HttpError(503, `Treasury ${address} has no confirmed UTXOs to escrow from`);
   }
-  return buildP2pkhTx({
+  const tx = await buildP2pkhTx({
     key: opts.treasuryKey,
     utxos,
     outputs: [{ address: opts.escrowAddress, satoshis: opts.satoshis }],
     feeSats: feeSatsFor(opts.env),
     marker: opts.marker,
+    fetchParent: (txid) => loadParentTx(txid, opts.env.DB, fetchParentTx),
   });
+  if (opts.env.DB) await recordPaymentCoins(opts.env.DB, tx, address);
+  return tx;
 }
 
 /** Treasury → destination P2PKH output for POST /agent/send, with an audit marker OP_RETURN. */
@@ -269,13 +276,16 @@ export async function buildDirectSendTx(opts: {
   if (utxos.length === 0) {
     throw new HttpError(503, `Treasury ${address} has no confirmed UTXOs to send from`);
   }
-  return buildP2pkhTx({
+  const tx = await buildP2pkhTx({
     key: opts.treasuryKey,
     utxos,
     outputs: [{ address: opts.dest, satoshis: opts.satoshis }],
     feeSats: feeSatsFor(opts.env),
     marker: opts.marker,
+    fetchParent: (txid) => loadParentTx(txid, opts.env.DB, fetchParentTx),
   });
+  if (opts.env.DB) await recordPaymentCoins(opts.env.DB, tx, address);
+  return tx;
 }
 
 /** Escrow key spends its single P2PKH UTXO into payout/refund outputs. */
@@ -309,7 +319,7 @@ export async function arcBroadcastTx(
   txHex: string,
 ): Promise<{ txid: string; raw: unknown; via: string }> {
   const primary = (env.ARC_URL || ARC_FALLBACK).replace(/\/$/, "");
-  const fallbacks = [primary, "https://arc.taal.com/v1"];
+  const fallbacks = [primary, "https://arc.taal.com/v1", "https://arc.gorillapool.io/v1"];
   if (typeof env.ARC_FALLBACK_URL === "string" && env.ARC_FALLBACK_URL) {
     fallbacks.splice(1, 0, env.ARC_FALLBACK_URL.replace(/\/$/, ""));
   }

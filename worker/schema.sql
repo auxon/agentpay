@@ -92,6 +92,33 @@ CREATE TABLE IF NOT EXISTS ap_x402_payments (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Treasury outpoints we have already signed away. WhatsOnChain /unspent can
+-- lag 20+ minutes behind our own broadcasts, so UTXO selection must never
+-- reuse a row here regardless of what the indexer reports.
+CREATE TABLE IF NOT EXISTS ap_treasury_spent (
+  txid TEXT NOT NULL,
+  vout INTEGER NOT NULL,
+  value INTEGER NOT NULL DEFAULT 0,
+  spend_txid TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (txid, vout)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_treasury_spent_spend ON ap_treasury_spent(spend_txid);
+
+-- Change outputs we created and have not spent yet. hex is the parent tx so
+-- a later child can attach EF/BEEF even if ARC has not indexed the parent.
+-- height 0 = unconfirmed / unseen; we do not spend these unless explicitly
+-- allowed, and even then we attach the parent.
+CREATE TABLE IF NOT EXISTS ap_treasury_change (
+  txid TEXT NOT NULL,
+  vout INTEGER NOT NULL,
+  value INTEGER NOT NULL DEFAULT 0,
+  hex TEXT NOT NULL DEFAULT '',
+  height INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (txid, vout)
+);
+
 -- Small key/value store for cached operator state (treasury balance snapshots).
 CREATE TABLE IF NOT EXISTS ap_meta (
   key TEXT PRIMARY KEY,

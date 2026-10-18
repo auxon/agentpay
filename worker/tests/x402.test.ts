@@ -13,6 +13,7 @@ import {
   treasuryStatus,
   type BsvRequirements,
 } from "../src/x402";
+import { loadParentTx } from "../src/coins";
 import { HttpError, type AppEnv } from "../src/types";
 import { makeTestDb } from "./helpers";
 
@@ -392,5 +393,91 @@ describe("prepareBsvPayment", () => {
         }),
       ).rejects.toThrow(/cap/);
     });
+  });
+
+  it("never reselects a spent outpoint when the indexer still lists it as unspent", async () => {
+    const db = makeTestDb();
+    const key = PrivateKey.fromRandom();
+    const firstCoin = { tx_hash: "aa".repeat(32), tx_pos: 0, value: 80_000, height: 200 };
+    const secondCoin = { tx_hash: "bb".repeat(32), tx_pos: 0, value: 70_000, height: 199 };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/unspent")) {
+        return new Response(JSON.stringify([firstCoin, secondCoin]), { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    });
+    const reqs: BsvRequirements = { payTo: PAY_TO, satoshis: 10, resourceUrl: null, description: null };
+    const env = E({ SITE_WALLET_WIF: key.toWif(), DB: db });
+    const first = await prepareBsvPayment(env, reqs);
+    const firstTx = Transaction.fromHex(
+      (JSON.parse(Buffer.from(first.paymentSignature, "base64").toString("utf8")) as { txHex: string }).txHex,
+    );
+    expect(firstTx.inputs[0].sourceTXID).toBe(firstCoin.tx_hash);
+    const spent = await db
+      .prepare("SELECT spend_txid FROM ap_treasury_spent WHERE txid = ? AND vout = ?")
+      .bind(firstCoin.tx_hash, 0)
+      .first<{ spend_txid: string }>();
+    expect(spent?.spend_txid).toBe(first.txid);
+
+    const second = await prepareBsvPayment(env, reqs);
+    const secondTx = Transaction.fromHex(
+      (JSON.parse(Buffer.from(second.paymentSignature, "base64").toString("utf8")) as { txHex: string }).txHex,
+    );
+    expect(secondTx.inputs[0].sourceTXID).toBe(secondCoin.tx_hash);
+    expect(second.txid).not.toBe(first.txid);
+  });
+
+  it("skips unconfirmed change even when WOC lists it (orphaned-parent guard)", async () => {
+    const db = makeTestDb();
+    const key = PrivateKey.fromRandom();
+    const coin = { tx_hash: "aa".repeat(32), tx_pos: 0, value: 80_000, height: 200 };
+    const listed = [coin];
+    const hexFetches: string[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/unspent")) {
+        return new Response(JSON.stringify(listed), { status: 200 });
+      }
+      if (url.endsWith("/hex")) hexFetches.push(url);
+      return new Response("Not Found", { status: 404 });
+    });
+    const reqs: BsvRequirements = { payTo: PAY_TO, satoshis: 10, resourceUrl: null, description: null };
+    const env = E({ SITE_WALLET_WIF: key.toWif(), DB: db });
+    const first = await prepareBsvPayment(env, reqs);
+    const change = await db
+      .prepare("SELECT txid, vout, value, hex FROM ap_treasury_change LIMIT 1")
+      .first<{ txid: string; vout: number; value: number; hex: string }>();
+    expect(change?.hex).toBeTruthy();
+    expect(change?.value).toBeGreaterThan(0);
+
+    listed.splice(
+      0,
+      listed.length,
+      coin,
+      { tx_hash: change!.txid, tx_pos: change!.vout, value: change!.value, height: 0 },
+    );
+    await expect(prepareBsvPayment(env, reqs)).rejects.toThrow(/unconfirmed|no confirmed/);
+
+    listed.splice(0, listed.length, {
+      tx_hash: change!.txid,
+      tx_pos: change!.vout,
+      value: change!.value,
+      height: 300,
+    });
+    const parent = await loadParentTx(change!.txid, db, async () => null);
+    expect(parent?.id("hex")).toBe(change!.txid);
+
+    hexFetches.length = 0;
+    const second = await prepareBsvPayment(env, reqs);
+    const payload = JSON.parse(Buffer.from(second.paymentSignature, "base64").toString("utf8")) as {
+      txHex: string;
+      txHexEF?: string;
+      txHexBEEF?: string;
+    };
+    const secondTx = Transaction.fromHex(payload.txHex);
+    expect(secondTx.inputs[0].sourceTXID).toBe(change!.txid);
+    expect(hexFetches.some((u) => u.includes(change!.txid))).toBe(false);
+    expect(payload.txHexEF || payload.txHexBEEF).toBeTruthy();
   });
 });

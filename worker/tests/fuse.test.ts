@@ -6,9 +6,11 @@ import {
   FUSE_DEFAULT_MODEL,
   FUSE_PUBLIC_CHAT_URL,
   parseFuseChatBody,
+  parseFuseErrorCode,
   parseFuseModel,
   publicizeFuseChallenge,
   quoteFuseChat,
+  setFusePaidSleepForTests,
 } from "../src/fuse";
 import { BSV_NETWORK } from "../src/x402";
 import { HttpError, type AppEnv } from "../src/types";
@@ -80,10 +82,17 @@ async function fundedAgent(db: TestDb, cents = 500) {
   return { wallet, agent, key };
 }
 
-function stubNetwork(opts: { fusePaid?: Record<string, unknown>; fuseStatus?: number } = {}) {
+function stubNetwork(
+  opts: {
+    fusePaid?: Record<string, unknown>;
+    fuseStatus?: number;
+    paidResponses?: Array<{ status: number; body: unknown }>;
+  } = {},
+) {
   const wifKey = PrivateKey.fromRandom();
   const utxos = [{ tx_hash: "ab".repeat(32), tx_pos: 0, value: 100_000, height: 100 }];
   const paidCalls: Array<{ signature: string | null; body: unknown }> = [];
+  let paidIdx = 0;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
@@ -96,6 +105,13 @@ function stubNetwork(opts: { fusePaid?: Record<string, unknown>; fuseStatus?: nu
         return new Response(JSON.stringify(challenge), {
           status: 402,
           headers: { "content-type": "application/json", "PAYMENT-REQUIRED": b64json(challenge) },
+        });
+      }
+      if (opts.paidResponses && paidIdx < opts.paidResponses.length) {
+        const item = opts.paidResponses[paidIdx++];
+        return new Response(JSON.stringify(item.body), {
+          status: item.status,
+          headers: { "content-type": "application/json" },
         });
       }
       return new Response(
@@ -121,6 +137,7 @@ function stubNetwork(opts: { fusePaid?: Record<string, unknown>; fuseStatus?: nu
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  setFusePaidSleepForTests(null);
 });
 
 function fuse402Response(resourceUrl?: string): Response {
@@ -368,5 +385,82 @@ describe("POST /agent/chat", () => {
     );
     expect(status).toBe(400);
     expect(String(body.error)).toMatch(/Unknown model/);
+  });
+
+  it("retries empty_completion with the same PAYMENT-SIGNATURE", async () => {
+    setFusePaidSleepForTests(async () => {});
+    const db = makeTestDb();
+    const { key, wallet } = await fundedAgent(db);
+    const { wif, paidCalls } = stubNetwork({
+      paidResponses: [
+        { status: 502, body: { error: "empty_completion", code: "empty_completion" } },
+        {
+          status: 200,
+          body: { id: "chatcmpl_retry", choices: [{ message: { role: "assistant", content: "pong" } }] },
+        },
+      ],
+    });
+    const { status, body } = await jsonOf(
+      await req(
+        "/api/agentpay/agent/chat",
+        db,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "fuse-fast",
+            messages: [{ role: "user", content: "ping" }],
+          }),
+        },
+        { SITE_WALLET_WIF: wif, FUSE_CHAT_URL: FUSE_URL },
+      ),
+    );
+    expect(status).toBe(200);
+    expect(body.text).toBe("pong");
+    const paid = paidCalls.filter((c) => c.signature);
+    expect(paid).toHaveLength(2);
+    expect(paid[0].signature).toBe(paid[1].signature);
+    const row = await db.prepare("SELECT balance_cents FROM ap_wallets WHERE id = ?").bind(wallet.id).first<{
+      balance_cents: number;
+    }>();
+    expect(row?.balance_cents).toBe(499);
+  });
+
+  it("retries payment_unconfirmed with the same signature and fails closed on double-spend", async () => {
+    setFusePaidSleepForTests(async () => {});
+    expect(parseFuseErrorCode(402, JSON.stringify({ error: "payment_unconfirmed" }))).toBe("payment_unconfirmed");
+    expect(parseFuseErrorCode(402, JSON.stringify({ code: "payment_double_spend" }))).toBe("payment_double_spend");
+
+    const db = makeTestDb();
+    const { key, wallet } = await fundedAgent(db);
+    const { wif, paidCalls } = stubNetwork({
+      paidResponses: [
+        { status: 402, body: { error: "payment_unconfirmed", code: "payment_unconfirmed" } },
+        { status: 402, body: { error: "payment_double_spend", code: "payment_double_spend" } },
+      ],
+    });
+    const { status, body } = await jsonOf(
+      await req(
+        "/api/agentpay/agent/chat",
+        db,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            messages: [{ role: "user", content: "ping" }],
+          }),
+        },
+        { SITE_WALLET_WIF: wif, FUSE_CHAT_URL: FUSE_URL },
+      ),
+    );
+    expect(status).toBe(402);
+    expect(String(body.error)).toMatch(/payment_double_spend/);
+    const paid = paidCalls.filter((c) => c.signature);
+    expect(paid).toHaveLength(2);
+    expect(paid[0].signature).toBe(paid[1].signature);
+    const row = await db.prepare("SELECT balance_cents FROM ap_wallets WHERE id = ?").bind(wallet.id).first<{
+      balance_cents: number;
+    }>();
+    expect(row?.balance_cents).toBe(500);
   });
 });
