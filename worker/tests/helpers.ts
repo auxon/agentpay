@@ -52,7 +52,15 @@ export function makeTestDb(): TestDb {
     raw,
     prepare: (sql: string) => new FakeStatement(raw, sql),
     exec: async (sql: string) => {
-      raw.exec(sql);
+      // Match production D1: exec() splits on newlines and runs each fragment
+      // as its own statement, so a multi-line CREATE TABLE throws
+      // "incomplete input". Callers that need multi-line SQL must use
+      // prepare().run() instead.
+      for (const line of sql.split("\n")) {
+        const fragment = line.trim();
+        if (!fragment) continue;
+        raw.exec(fragment);
+      }
       return { count: 0, duration: 0 };
     },
     batch: async () => [],

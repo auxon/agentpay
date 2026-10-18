@@ -37,8 +37,10 @@ const DDL = [
 ];
 
 export async function ensureTreasuryTables(db: D1Database): Promise<void> {
+  // D1 exec() splits its input on newlines, so a multi-line CREATE TABLE fails
+  // with "incomplete input". Run each statement as one prepared statement.
   for (const sql of DDL) {
-    await db.exec(sql);
+    await db.prepare(sql).run();
   }
 }
 
