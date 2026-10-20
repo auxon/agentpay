@@ -1,8 +1,8 @@
 # MCP Registry publishing — agentpay
 
 **Status: PUBLISHED.** `com.entangleit/agentpay` v0.1.0 is live in the official
-registry (namespace verified for `entangleit.com`). This repo is at **v0.2.0**
-(pay-per-call LLM / standard x402 v2 `accepts[]`); republish when deploying:
+registry (namespace verified for `entangleit.com`). This repo is at **v0.3.0**
+(pay-per-call LLM + extract / standard x402 v2 `accepts[]`); republish when deploying:
 
 ```bash
 curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=com.entangleit/agentpay"
@@ -49,8 +49,8 @@ lost, generate a new pair, redeploy the new `.well-known/mcp-registry-auth`
 PulseMCP, Glama, and others ingest the official registry automatically; no extra
 submission is normally needed. For Smithery/mcp.so, reuse this blurb:
 
-> agentpay — pay-per-call LLM with no API key, plus card-funded prepaid wallets
-> for AI agents. Top up by card via Stripe, mint scoped agent keys with daily
-> limits and approval gates, and let agents pay Fuse chat completions and any
-> x402 (BSV mainnet) API over MCP with a receipt per call. Public discovery
-> tools need no auth. https://entangleit.com/agentpay
+> agentpay — pay-per-call LLM and typed extract with no API key, plus card-funded
+> prepaid wallets for AI agents. Top up by card via Stripe, mint scoped agent keys
+> with daily limits and approval gates, and let agents pay Fuse chat / extract
+> and any x402 (BSV mainnet) API over MCP with a receipt per call. Public
+> discovery tools need no auth. https://entangleit.com/agentpay

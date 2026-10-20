@@ -345,6 +345,23 @@ export function agentChatAllowed(allowed: string[], model: string): boolean {
   return allowed.includes(`fuse:${model}`);
 }
 
+/** Allowlist for the dedicated Fuse `extract` tool. Empty / * = all. */
+export function agentExtractAllowed(allowed: string[]): boolean {
+  if (allowed.length === 0) return true;
+  return (
+    allowed.includes("*") ||
+    allowed.includes("extract") ||
+    allowed.includes("fuse:extract") ||
+    allowed.includes("fuse:fuse-extract") ||
+    allowed.includes("fuse:*")
+  );
+}
+
+export function agentFuseAllowed(allowed: string[], tool: string): boolean {
+  if (tool === "extract" || tool === "fuse-extract") return agentExtractAllowed(allowed);
+  return agentChatAllowed(allowed, tool);
+}
+
 export async function getAgentPolicy(db: D1Database, agentId: string): Promise<AgentPolicyRow> {
   const row = await db
     .prepare("SELECT * FROM ap_agent_policies WHERE agent_id = ?")

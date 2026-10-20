@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.entangleit/agentpay",
   "title": "agentpay — card-funded wallets for AI agents",
-  "description": "Pay-per-call LLM (no API key) plus prepaid USD wallets, scoped keys, and BSV x402 over MCP.",
-  "version": "0.2.0",
+  "description": "Pay-per-call LLM + extract (no API key), prepaid wallets, scoped keys, BSV x402 MCP.",
+  "version": "0.3.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -11,7 +11,7 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Agent key: Bearer agp_… (mint one at entangleit.com/agentpay). Optional — list_services, service_quote, and claim_trial are public. chat needs a key.",
+          "description": "Agent key: Bearer agp_… (mint one at entangleit.com/agentpay). Optional — list_services, service_quote, and claim_trial are public. chat and extract need a key.",
           "isRequired": false,
           "isSecret": true
         }
