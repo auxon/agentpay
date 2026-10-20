@@ -99,6 +99,9 @@ MCP tool \`chat\` / REST \`POST /agent/chat\`
 Body: \`{ model, messages }\` (OpenAI-style). Models: \`fuse-fast\` (500 sats), \`fuse-smart\` (2500 sats).
 agentpay settles Fuse's standard x402 v2 402 (\`accepts[]\`, BSV \`exact\`, \`bsv:mainnet\`, asset \`BSV\`) from the site wallet and returns the completion plus \`receiptUrl\` and \`txid\`.
 Fuse: https://entangleit.com/fuse/v1/chat/completions — discovery https://entangleit.com/fuse/.well-known/x402
+agentpay discovery (generic x402 clients / indexers): https://entangleit.com/api/agentpay/.well-known/x402 · catalog https://entangleit.com/api/agentpay/discovery/resources
+Public x402-gated chat/extract (no agp_ key): POST https://entangleit.com/api/agentpay/x402/chat and /x402/extract — 402 + PAYMENT-REQUIRED (BSV exact, bsv:mainnet).
+BSV facilitator: POST /api/agentpay/x402/verify · /x402/settle · GET /x402/supported. Registration: docs/X402-DISCOVERY.md.
 
 ## Typed extract (no API key)
 
@@ -111,6 +114,7 @@ Fuse: https://entangleit.com/fuse/v1/extract
 ## Other spend
 
 - \`list_services\` / \`service_quote\` / \`pay_service\` — x402market registry (legacy single-object *and* standard v2 \`accepts[]\` BSV challenges).
+- Public x402 (no key): \`POST /x402/chat\`, \`POST /x402/extract\`; discovery \`/.well-known/x402\`; facilitator \`/x402/verify\` + \`/x402/settle\`.
 - \`send {dest, sats, idempotency_key}\` — pay a BSV P2PKH address on-chain (\`settlement: live\`, \`txid\` is a BSV tx) or an agentpay wallet id \`apw_…\` as an internal ledger credit (\`settlement: internal\`, \`txid\` is a receipt id). Pass the public wallet id from \`get_balance\` / \`/agent/me\`, never the secret token. Daily limits, allowlists (\`spend\` or \`agent_send\`), and approvals apply.
 - Wallet limits, scoped keys, and claim_trial budgets are enforced on every debit.
 `;

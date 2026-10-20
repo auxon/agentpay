@@ -843,3 +843,11 @@ export async function processEscrowEvent(
 }
 
 export { listEscrowRows };
+
+/** Best-effort trust ping after a marketplace payout. Optional; failures are ignored by callers. */
+export async function pushTrustBountyPaid(
+  _env: AppEnv,
+  _input: { subject: string; bountyId: string; amountSats: number; txid: string; kind?: string },
+): Promise<boolean> {
+  return false;
+}

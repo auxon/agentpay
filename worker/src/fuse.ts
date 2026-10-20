@@ -15,6 +15,7 @@ import {
   parseBsvRequirements,
   type BsvRequirements,
 } from "./x402";
+import { paymentSignatureHeaders, readPaymentRequiredHeader } from "./x402-spec";
 
 export const FUSE_SERVICE_ID = "fuse";
 /** Public chat completions URL — always used in x402 resource/receipt fields. */
@@ -180,7 +181,11 @@ export async function fuseFetch(env: AppEnv, body: unknown, opts: FuseFetchOpts 
     "content-type": "application/json",
     "user-agent": fuseUserAgent(),
   });
-  if (opts.paymentSignature) headers.set("PAYMENT-SIGNATURE", opts.paymentSignature);
+  if (opts.paymentSignature) {
+    for (const [key, value] of Object.entries(paymentSignatureHeaders(opts.paymentSignature))) {
+      headers.set(key, value);
+    }
+  }
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? FUSE_CHAT_TIMEOUT_MS);
   const init: RequestInit = {
@@ -203,7 +208,7 @@ export async function fuseFetch(env: AppEnv, body: unknown, opts: FuseFetchOpts 
 }
 
 export function challengeFrom402(res: Response, bodyText: string): unknown {
-  const header = res.headers.get("PAYMENT-REQUIRED");
+  const header = readPaymentRequiredHeader(res.headers);
   if (header) {
     try {
       return decodePaymentRequiredHeader(header);
