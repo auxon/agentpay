@@ -5,6 +5,7 @@
  */
 import { HttpError } from "./types";
 import { cleanStr } from "./ids";
+import { paymentSignatureHeaders, readPaymentRequiredHeader } from "./x402-spec";
 
 export interface RegistryTool {
   name: string;
@@ -166,7 +167,7 @@ export async function callServiceTool(
 ): Promise<Response> {
   let url = tool.path;
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (opts.paymentSignature) headers["PAYMENT-SIGNATURE"] = opts.paymentSignature;
+  if (opts.paymentSignature) Object.assign(headers, paymentSignatureHeaders(opts.paymentSignature));
   if (opts.trustAttestation) headers["X-Trust-Attestation"] = opts.trustAttestation;
   const params = { ...(opts.params ?? {}) };
 
@@ -228,7 +229,7 @@ export async function quoteService(
   if (res.status !== 402) {
     throw new HttpError(502, `Seller did not challenge (got ${res.status}, want 402)`);
   }
-  const header = res.headers.get("PAYMENT-REQUIRED");
+  const header = readPaymentRequiredHeader(res.headers);
   if (!header) throw new HttpError(502, "402 without PAYMENT-REQUIRED header");
   let requirements: unknown;
   try {

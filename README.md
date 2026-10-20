@@ -7,8 +7,10 @@ LLM with no API key** (`chat` → Fuse) or **typed extract** (`extract` → Fuse
 discover paid services (the
 [x402market](https://entangleit.com/x402market/) registry), spend, and fetch
 receipts. Paid calls settle on **BSV mainnet over x402 v2** from the operator's
-site wallet (legacy single-object challenges and standard `accepts[]`). No
-browser wallet required.
+site wallet (legacy single-object challenges and standard `accepts[]`). The
+network id is the registered CAIP-2 `bsv:mainnet`. No browser wallet required.
+Discovery: `GET /api/agentpay/.well-known/x402` and
+[docs/X402-DISCOVERY.md](docs/X402-DISCOVERY.md).
 
 Live target: `https://entangleit.com/agentpay/` (dashboard) +
 `https://entangleit.com/api/agentpay/*` (worker `agentpay-api`) +
@@ -151,9 +153,17 @@ stripe listen --forward-to localhost:8788/api/agentpay/webhooks/stripe
 
 It builds and signs an exact P2PKH payment from the site wallet (full parent tx
 attached for ARC validation, flat fee), debits the agent wallet, then retries
-with `PAYMENT-SIGNATURE: base64({x402Version, scheme, network, txHex, encoding: "raw-hex"})`
-(plus `accepted` + `payload.rawtx` when the challenge was an `accepts[]` entry).
-The seller broadcasts via ARC and returns the resource (and `PAYMENT-RESPONSE`).
+with `PAYMENT-SIGNATURE` (and the v1 `X-PAYMENT` alias) carrying the spec v2
+envelope `{x402Version, resource, accepted, payload}` plus legacy
+`{scheme, network, txHex, encoding: "raw-hex"}` so existing BSV sellers keep
+working. The seller broadcasts via ARC and returns the resource (and
+`PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE`).
+
+agentpay also exposes a **BSV facilitator** (`POST /x402/verify`,
+`POST /x402/settle`, `GET /x402/supported`) and public paid resources
+(`POST /x402/chat`, `POST /x402/extract`) that emit spec-conformant 402
+challenges for generic clients and indexers. How to list them:
+[docs/X402-DISCOVERY.md](docs/X402-DISCOVERY.md).
 A seller rejection refunds the debit (`refund` ledger row) and unwinds the agent's
 daily counter. Free tools are called straight through with no debit.
 
@@ -238,8 +248,9 @@ curl -X POST localhost:8788/api/agentpay/agent/pay-service \
 # 1. schema (additive, IF NOT EXISTS) + worker
 cd worker
 npm run db:apply          # wrangler d1 execute entangleit --file=schema.sql --remote
-# Additive column migration (existing D1 only; skip on a fresh schema.sql apply):
-npx wrangler d1 execute entangleit --file=migrations/2026-10-20-ap-sends-wallet-dest.sql --remote
+# Do NOT run migrations/2026-10-20-ap-sends-wallet-dest.sql on prod —
+# ap_sends already has those columns; a second ALTER fails. Fresh D1s get
+# the columns from schema.sql.
 npx wrangler deploy       # attaches entangleit.com/api/agentpay/*
 
 # 2. frontend: portfolio build first (wipes public/), then merges
@@ -256,7 +267,12 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `GET /health` | — | Service + Stripe + registry status |
+| `GET /health` | — | Service + Stripe + registry + x402 facilitator/discovery URLs |
+| `GET /.well-known/x402` | — | x402scan-style catalog (agentpay + Fuse URLs) |
+| `GET /discovery/resources` | — | Spec §8 Bazaar catalog |
+| `GET /x402/supported` · `GET /supported` | — | Facilitator kinds (`exact` / `bsv:mainnet`) |
+| `POST /x402/verify` · `/settle` (aliases `/verify`, `/v2/x402/verify`, …) | — | BSV facilitator (read-only verify; settle broadcasts) |
+| `GET/POST /x402/chat` · `/x402/extract` | — | Public x402-gated LLM/extract (402 + `PAYMENT-REQUIRED`) |
 | `POST /wallets` | — | Create wallet, returns `token` + `recoveryCode` once |
 | `POST /wallets/recover` | recovery code | Reset the wallet token |
 | `GET /wallets/me` | `apw_` | Wallet, agents, ledger, receipts |
@@ -341,7 +357,7 @@ Cursor / any MCP client:
 - Guarded atomic debits; no overdraft, no negative balances, ever.
 - Agent keys and wallet tokens stored hashed; raw values shown once. Recovery codes hashed too.
 - Every spend = ledger event + receipt; every top-up = ledger event; failed x402 = one refund keyed by receipt id.
-- x402 payloads carry the full v2 envelope; signed txs attach their parent tx; the seller broadcasts via ARC (agentpay never broadcasts).
+- x402 payloads carry the full v2 envelope (`accepted` + `payload`) plus legacy `txHex` fields; signed txs attach their parent tx. As a buyer we still broadcast EF/BEEF so ARC has the parent; as a facilitator `/settle` broadcasts the buyer's raw tx.
 - x402 buys only confirmed UTXOs, never reuses a txid (random OP_RETURN nonce), and refunds exactly once per charge (refund keyed by receipt id, replay guard on settled txids).
 - Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `send`, `pay_service`, `chat`, and `extract`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
 

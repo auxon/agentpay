@@ -121,6 +121,10 @@ export interface AppEnv {
   ARC_API_KEY?: string;
   /** Optional second ARC endpoint tried when ARC_URL fails. */
   ARC_FALLBACK_URL?: string;
+  /** Marketplace approval window in days (default applied in market.ts). */
+  MARKET_APPROVAL_DAYS?: string;
+  /** Fuse/oracle decision URL used by marketplace arbitration. */
+  ORACLE_URL?: string;
 }
 
 export interface WalletRow {

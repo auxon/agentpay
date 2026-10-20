@@ -159,6 +159,18 @@ import {
   siteWalletConfigured,
   treasuryStatus,
 } from "./x402";
+import { facilitatorSettle, facilitatorSupported, facilitatorVerify } from "./x402-facilitator";
+import {
+  discoveryResources,
+  filterDiscovery,
+  fulfillPaidChat,
+  fulfillPaidExtract,
+  paymentPayloadFromRequest,
+  unpaidChatChallenge,
+  unpaidExtractChallenge,
+  wellKnownCatalog,
+} from "./x402-server";
+import { readPaymentResponseHeader } from "./x402-spec";
 import { API_PREFIX, APP_PREFIX, MCP_PATH, PUBLIC_SITE, siteOrigin } from "./paths";
 import { cleanStr, newId, nowIso, sha256Hex, timingSafeEqualStr } from "./ids";
 import { verifyGoogleIdToken } from "./google";
@@ -166,7 +178,9 @@ import { verifyGoogleIdToken } from "./google";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, PAYMENT-SIGNATURE, X-PAYMENT, PAYMENT-REQUIRED, PAYMENT-RESPONSE",
+  "Access-Control-Expose-Headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE, X-PAYMENT-RESPONSE",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -546,6 +560,15 @@ api.get("/health", async (c) => {
       siteWalletAddress: siteWalletAddress(env),
       maxPaymentSats: maxPaymentSats(env),
       treasury,
+      version: 2,
+      network: "bsv:mainnet",
+      discovery: `${PUBLIC_SITE}${API_PREFIX}/discovery/resources`,
+      wellKnown: `${PUBLIC_SITE}${API_PREFIX}/.well-known/x402`,
+      facilitator: {
+        verify: `${PUBLIC_SITE}${API_PREFIX}/x402/verify`,
+        settle: `${PUBLIC_SITE}${API_PREFIX}/x402/settle`,
+        supported: `${PUBLIC_SITE}${API_PREFIX}/x402/supported`,
+      },
     },
     fuse: {
       chat: FUSE_PUBLIC_CHAT_URL,
@@ -555,6 +578,61 @@ api.get("/health", async (c) => {
       docs: FUSE_DOCS_URL,
     },
   });
+});
+
+// ---------- x402 v2 facilitator + discovery + public paid resources ----------
+
+api.get("/.well-known/x402", (c) => c.json(wellKnownCatalog(c.req.raw, c.env)));
+
+api.get("/discovery/resources", (c) => {
+  const limit = Number(c.req.query("limit") ?? "") || 20;
+  const offset = Number(c.req.query("offset") ?? "") || 0;
+  const listed = filterDiscovery(discoveryResources(c.req.raw, c.env), {
+    type: c.req.query("type") ?? undefined,
+    payTo: c.req.query("payTo") ?? undefined,
+    scheme: c.req.query("scheme") ?? undefined,
+    network: c.req.query("network") ?? undefined,
+    limit,
+    offset,
+  });
+  return c.json({ x402Version: 2, ...listed });
+});
+
+api.get("/x402/supported", (c) => {
+  const address = siteWalletAddress(c.env);
+  return c.json(facilitatorSupported(address ? [address] : []));
+});
+api.get("/supported", (c) => {
+  const address = siteWalletAddress(c.env);
+  return c.json(facilitatorSupported(address ? [address] : []));
+});
+
+async function facilitatorVerifyRoute(c: ApiContext) {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await facilitatorVerify(body));
+}
+async function facilitatorSettleRoute(c: ApiContext) {
+  const body = await c.req.json().catch(() => ({}));
+  return c.json(await facilitatorSettle(c.env, body));
+}
+api.post("/x402/verify", facilitatorVerifyRoute);
+api.post("/verify", facilitatorVerifyRoute);
+api.post("/v2/x402/verify", facilitatorVerifyRoute);
+api.post("/x402/settle", facilitatorSettleRoute);
+api.post("/settle", facilitatorSettleRoute);
+api.post("/v2/x402/settle", facilitatorSettleRoute);
+
+api.get("/x402/chat", async (c) => unpaidChatChallenge(c.env, c.req.raw, c.req.query("model") ?? "fuse-fast"));
+api.post("/x402/chat", async (c) => {
+  const payload = paymentPayloadFromRequest(c.req.raw);
+  if (!payload) return unpaidChatChallenge(c.env, c.req.raw);
+  return fulfillPaidChat(c.env, c.req.raw, payload);
+});
+api.get("/x402/extract", async (c) => unpaidExtractChallenge(c.env, c.req.raw, c.req.query("size") ?? "S"));
+api.post("/x402/extract", async (c) => {
+  const payload = paymentPayloadFromRequest(c.req.raw);
+  if (!payload) return unpaidExtractChallenge(c.env, c.req.raw);
+  return fulfillPaidExtract(c.env, c.req.raw, payload);
 });
 
 // ---------- Google sign-in (public) ----------
@@ -1596,7 +1674,7 @@ api.post("/agent/pay-service", async (c) => {
       throw new HttpError(502, `Seller unreachable after signing payment: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
     }
 
-    const paymentResponse = res.headers.get("PAYMENT-RESPONSE");
+    const paymentResponse = readPaymentResponseHeader(res.headers);
     const seller = await sellerResponse(res);
     const settled = seller.status < 400 || Boolean(paymentResponse);
     if (!settled) {
@@ -1798,7 +1876,7 @@ api.post("/agent/chat", async (c) => {
         : new HttpError(502, `Fuse unreachable after signing payment: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
     }
 
-    const paymentResponse = res.headers.get("PAYMENT-RESPONSE");
+    const paymentResponse = readPaymentResponseHeader(res.headers);
     const fuseReceipt = res.headers.get("X-Fuse-Receipt");
     const seller = await sellerResponse(res);
     const settled = seller.status < 400 || Boolean(paymentResponse);
@@ -2024,7 +2102,7 @@ api.post("/agent/extract", async (c) => {
         : new HttpError(502, `Fuse unreachable after signing payment: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
     }
 
-    const paymentResponse = res.headers.get("PAYMENT-RESPONSE");
+    const paymentResponse = readPaymentResponseHeader(res.headers);
     const fuseReceiptHeader = res.headers.get("X-Fuse-Receipt");
     const seller = await sellerResponse(res);
     const settled = seller.status < 400 || Boolean(paymentResponse);

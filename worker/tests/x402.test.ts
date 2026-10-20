@@ -50,6 +50,8 @@ describe("parseBsvRequirements", () => {
       description: "timestamp",
       lockingScriptHex: null,
       accepted: null,
+      resource: { url: "https://seller.test/api/timestamp", description: "timestamp" },
+      maxTimeoutSeconds: undefined,
     });
   });
 
@@ -59,6 +61,9 @@ describe("parseBsvRequirements", () => {
   });
 
   it("rejects wrong network, asset, scheme, payTo, and amount", () => {
+    expect(() =>
+      parseBsvRequirements(requirements({ network: "bip122:000000000019d6689c085ae165831e93" })),
+    ).toThrow(/Ambiguous Bitcoin-family/);
     expect(() => parseBsvRequirements(requirements({ network: "base:mainnet" }))).toThrow(/network/);
     expect(() => parseBsvRequirements(requirements({ asset: "erc20:usdc" }))).toThrow(/asset/);
     expect(() => parseBsvRequirements(requirements({ scheme: "upto" }))).toThrow(/scheme/);
@@ -152,6 +157,7 @@ describe("parseBsvRequirements", () => {
     const payload = paymentSignaturePayload("deadbeef", parsed);
     expect(payload.txHex).toBe("deadbeef");
     expect(payload.encoding).toBe("raw-hex");
+    expect(payload.accepted).toMatchObject({ scheme: "exact", network: BSV_NETWORK, asset: "BSV" });
     expect((payload.payload as { rawtx: string }).rawtx).toBe("deadbeef");
     expect((payload.payload as { lockingScriptHex: string }).lockingScriptHex).toBe(parsed.lockingScriptHex);
   });

@@ -658,7 +658,7 @@ export async function arbitrateDispute(
     body: JSON.stringify(ask),
   });
   if (probe.status !== 402) fail(502, `oracle did not quote (got ${probe.status})`);
-  const header = probe.headers.get("PAYMENT-REQUIRED");
+  const header = probe.headers.get("PAYMENT-REQUIRED") ?? probe.headers.get("payment-required");
   if (!header) fail(502, "402 without PAYMENT-REQUIRED header");
   let requirements: unknown;
   try {
@@ -673,7 +673,11 @@ export async function arbitrateDispute(
   const prepared = await prepareBsvPayment(env, parseBsvRequirements(requirements));
   const paid = await fetch(`${oracleUrl(env)}/decision`, {
     method: "POST",
-    headers: { "content-type": "application/json", "PAYMENT-SIGNATURE": prepared.paymentSignature },
+    headers: {
+      "content-type": "application/json",
+      "PAYMENT-SIGNATURE": prepared.paymentSignature,
+      "X-PAYMENT": prepared.paymentSignature,
+    },
     body: JSON.stringify(ask),
   });
   if (!paid.ok) fail(502, `oracle call failed (${paid.status})`);

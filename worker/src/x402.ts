@@ -10,10 +10,10 @@
  *      `native:BSV`) and ignore other rails (e.g. Base USDC).
  *
  * We pay from the site wallet: build + sign an exact P2PKH payment, send it
- * back as `PAYMENT-SIGNATURE: base64({txHex, ...})`. We also broadcast EF/BEEF
- * ourselves (GorillaPool + TAAL + WhatsOnChain) so ARC has the parent before
- * the seller relays, and we record spent outpoints in D1 so indexer lag cannot
- * make us double-spend.
+ * back as `PAYMENT-SIGNATURE: base64({txHex, ...})` (and the v1 `X-PAYMENT`
+ * alias). We also broadcast EF/BEEF ourselves (GorillaPool + TAAL + WhatsOnChain)
+ * so ARC has the parent before the seller relays, and we record spent outpoints
+ * in D1 so indexer lag cannot make us double-spend.
  *
  * The site wallet is funded by the operator (same treasury model as Brainstorm
  * NFT mints). Agents pay USD cents into the ledger; the rail settles sats.
@@ -23,14 +23,29 @@ import { HttpError, type AppEnv } from "./types";
 import { nowIso } from "./ids";
 import { broadcastPaymentTx, txHexBEEF, txHexEF } from "./broadcast";
 import { filterSpendableUtxos, loadParentTx, recordPaymentCoins } from "./coins";
+import {
+  BSV_ASSET,
+  BSV_ASSET_LEGACY,
+  BSV_NETWORK,
+  DEFAULT_MAX_TIMEOUT_SECONDS,
+  P2PKH_RAWTX,
+  X402_SCHEME,
+  X402_VERSION,
+  decodeX402Json,
+  isAmbiguousBip122,
+  isBsvAsset,
+  knownPaymentFlow,
+  type PaymentRequirements,
+  type ResourceInfo,
+} from "./x402-spec";
 
-export const BSV_NETWORK = "bsv:mainnet";
-export const X402_SCHEME = "exact";
-/** Legacy x402market / BSV Wallets asset id. */
-export const BSV_ASSET_LEGACY = "native:BSV";
-/** Standard x402 v2 BSV asset id (Fuse and the x402 spec). */
-export const BSV_ASSET = "BSV";
-export const P2PKH_RAWTX = "p2pkh-rawtx";
+export {
+  BSV_ASSET,
+  BSV_ASSET_LEGACY,
+  BSV_NETWORK,
+  P2PKH_RAWTX,
+  X402_SCHEME,
+} from "./x402-spec";
 /** High enough for Fuse extract L (50,000 sats). Operators can lower this. */
 export const DEFAULT_MAX_PAYMENT_SATS = 50_000;
 /** ARC/GorillaPool enforces a relay minimum the SDK fee model undershoots. */
@@ -48,6 +63,9 @@ export interface BsvRequirements {
   lockingScriptHex?: string | null;
   /** The chosen `accepts[]` entry (standard v2), so the retry can echo `accepted`. */
   accepted?: Record<string, unknown> | null;
+  /** Envelope `resource` (v2), echoed on PAYMENT-SIGNATURE. */
+  resource?: ResourceInfo | null;
+  maxTimeoutSeconds?: number;
 }
 
 interface RawExtra {
@@ -71,23 +89,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isBsvAsset(asset: unknown): boolean {
-  if (asset === undefined || asset === null || asset === "") return true;
-  return asset === BSV_ASSET || asset === BSV_ASSET_LEGACY;
-}
-
 function payloadKind(extra: RawExtra | null | undefined): string | null {
   const kind = extra?.payloadFormat?.kind;
   return typeof kind === "string" && kind ? kind : null;
+}
+
+function extraPaymentFlow(extra: RawExtra | null | undefined): unknown {
+  return isRecord(extra) ? (extra as { paymentFlow?: unknown }).paymentFlow : undefined;
 }
 
 /** True when an `accepts[]` entry is a BSV exact P2PKH payment we can sign. */
 export function isBsvAccept(entry: unknown): entry is RawAccept {
   if (!isRecord(entry)) return false;
   const req = entry as RawAccept;
+  if (isAmbiguousBip122(req.network)) return false;
   if (req.network !== BSV_NETWORK) return false;
   if (req.scheme && req.scheme !== X402_SCHEME) return false;
   if (!isBsvAsset(req.asset)) return false;
+  if (!knownPaymentFlow(extraPaymentFlow(req.extra))) return false;
   const kind = payloadKind(req.extra);
   if (kind && kind !== P2PKH_RAWTX) return false;
   return true;
@@ -98,6 +117,12 @@ function parseOneAccept(
   envelopeResource?: { url?: unknown; description?: unknown } | null,
   accepted: Record<string, unknown> | null = null,
 ): BsvRequirements {
+  if (isAmbiguousBip122(req.network)) {
+    throw new HttpError(
+      502,
+      `Ambiguous Bitcoin-family network "${String(req.network)}" — BSV is ${BSV_NETWORK}, not ${req.network}`,
+    );
+  }
   if (req.network !== BSV_NETWORK) {
     throw new HttpError(502, `Unsupported x402 network "${String(req.network)}" (want ${BSV_NETWORK})`);
   }
@@ -106,6 +131,9 @@ function parseOneAccept(
   }
   if (req.scheme && req.scheme !== X402_SCHEME) {
     throw new HttpError(502, `Unsupported x402 scheme "${String(req.scheme)}" (want ${X402_SCHEME})`);
+  }
+  if (!knownPaymentFlow(extraPaymentFlow(req.extra))) {
+    throw new HttpError(502, `Unsupported x402 paymentFlow "${String(extraPaymentFlow(req.extra))}"`);
   }
   const kind = payloadKind(req.extra);
   if (kind && kind !== P2PKH_RAWTX) {
@@ -124,13 +152,24 @@ function parseOneAccept(
   }
   const resource = req.resource ?? envelopeResource ?? null;
   const locking = req.extra?.lockingScriptHex;
+  const timeoutRaw = isRecord(req) ? (req as { maxTimeoutSeconds?: unknown }).maxTimeoutSeconds : undefined;
+  const timeout = Number(timeoutRaw);
+  const resourceInfo: ResourceInfo | null =
+    resource && typeof resource.url === "string"
+      ? {
+          url: resource.url,
+          ...(typeof resource.description === "string" ? { description: resource.description } : {}),
+        }
+      : null;
   return {
     payTo,
     satoshis,
-    resourceUrl: typeof resource?.url === "string" ? resource.url : null,
-    description: typeof resource?.description === "string" ? resource.description : null,
+    resourceUrl: resourceInfo?.url ?? null,
+    description: resourceInfo?.description ?? (typeof resource?.description === "string" ? resource.description : null),
     lockingScriptHex: typeof locking === "string" && /^[0-9a-f]+$/i.test(locking) ? locking.toLowerCase() : null,
     accepted,
+    resource: resourceInfo,
+    maxTimeoutSeconds: Number.isFinite(timeout) && timeout > 0 ? timeout : undefined,
   };
 }
 
@@ -166,13 +205,42 @@ export function parseBsvRequirements(raw: unknown): BsvRequirements {
 
 /** Decode a PAYMENT-REQUIRED header (standard or URL-safe base64 JSON). */
 export function decodePaymentRequiredHeader(header: string): unknown {
-  const trimmed = header.trim();
-  const b64 = trimmed.replace(/-/g, "+").replace(/_/g, "/");
-  const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
-  const bin = atob(b64 + pad);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return JSON.parse(new TextDecoder().decode(bytes));
+  return decodeX402Json(header);
+}
+
+/** Synthesize a spec PaymentRequirements object from a parsed BSV challenge. */
+export function acceptedFromRequirements(requirements: BsvRequirements): PaymentRequirements {
+  if (requirements.accepted && isRecord(requirements.accepted)) {
+    const raw = requirements.accepted;
+    const timeout = Number(raw.maxTimeoutSeconds);
+    return {
+      scheme: typeof raw.scheme === "string" ? raw.scheme : X402_SCHEME,
+      network: typeof raw.network === "string" ? raw.network : BSV_NETWORK,
+      amount: typeof raw.amount === "string" ? raw.amount : String(requirements.satoshis),
+      asset: typeof raw.asset === "string" ? raw.asset : BSV_ASSET,
+      payTo: typeof raw.payTo === "string" ? raw.payTo : requirements.payTo,
+      maxTimeoutSeconds:
+        Number.isFinite(timeout) && timeout > 0
+          ? timeout
+          : (requirements.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS),
+      ...(isRecord(raw.extra) ? { extra: raw.extra } : {}),
+    };
+  }
+  return {
+    scheme: X402_SCHEME,
+    network: BSV_NETWORK,
+    amount: String(requirements.satoshis),
+    asset: BSV_ASSET,
+    payTo: requirements.payTo,
+    maxTimeoutSeconds: requirements.maxTimeoutSeconds ?? DEFAULT_MAX_TIMEOUT_SECONDS,
+    extra: {
+      chain: "bsv",
+      unit: "satoshi",
+      perCallSats: requirements.satoshis,
+      payloadFormat: { kind: P2PKH_RAWTX },
+      ...(requirements.lockingScriptHex ? { lockingScriptHex: requirements.lockingScriptHex } : {}),
+    },
+  };
 }
 
 export function maxPaymentSats(env: AppEnv): number {
@@ -442,34 +510,45 @@ export async function buildBsvPaymentTx(opts: {
   return tx;
 }
 
-/** PAYMENT-SIGNATURE JSON. Always includes txHex for existing sellers; v2
- *  accepts[] challenges also echo `accepted` and `payload.{rawtx,lockingScriptHex}`.
- *  EF/BEEF are extra so a seller/broadcaster that understands them can take the
- *  parent along; encoding stays raw-hex for compatibility. */
+/**
+ * PAYMENT-SIGNATURE JSON.
+ *
+ * Spec v2 requires `accepted` + `payload`. Existing BSV sellers also read
+ * top-level `txHex` / `scheme` / `network` / `encoding`, so those stay.
+ * EF/BEEF travel as extras so a seller/broadcaster that understands them can
+ * take the parent along.
+ */
 export function paymentSignaturePayload(
   txHex: string,
   requirements: BsvRequirements,
   extra?: { txHexEF?: string | null; txHexBEEF?: string | null },
 ): Record<string, unknown> {
+  const accepted = acceptedFromRequirements(requirements);
+  const payload: Record<string, unknown> = {
+    txHex,
+    rawtx: txHex,
+    ...(extra?.txHexEF ? { txHexEF: extra.txHexEF } : {}),
+    ...(extra?.txHexBEEF ? { txHexBEEF: extra.txHexBEEF } : {}),
+    ...(requirements.lockingScriptHex ? { lockingScriptHex: requirements.lockingScriptHex } : {}),
+  };
   const envelope: Record<string, unknown> = {
-    x402Version: 2,
+    x402Version: X402_VERSION,
     scheme: X402_SCHEME,
     network: BSV_NETWORK,
     txHex,
     encoding: "raw-hex",
+    accepted,
+    payload,
   };
-  if (extra?.txHexEF) envelope.txHexEF = extra.txHexEF;
-  if (extra?.txHexBEEF) envelope.txHexBEEF = extra.txHexBEEF;
-  if (requirements.accepted || requirements.lockingScriptHex) {
-    envelope.accepted = requirements.accepted ?? undefined;
-    envelope.payload = {
-      txHex,
-      rawtx: txHex,
-      ...(extra?.txHexEF ? { txHexEF: extra.txHexEF } : {}),
-      ...(extra?.txHexBEEF ? { txHexBEEF: extra.txHexBEEF } : {}),
-      ...(requirements.lockingScriptHex ? { lockingScriptHex: requirements.lockingScriptHex } : {}),
+  if (requirements.resource) envelope.resource = requirements.resource;
+  else if (requirements.resourceUrl) {
+    envelope.resource = {
+      url: requirements.resourceUrl,
+      ...(requirements.description ? { description: requirements.description } : {}),
     };
   }
+  if (extra?.txHexEF) envelope.txHexEF = extra.txHexEF;
+  if (extra?.txHexBEEF) envelope.txHexBEEF = extra.txHexBEEF;
   return envelope;
 }
 
