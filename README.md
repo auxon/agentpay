@@ -238,6 +238,8 @@ curl -X POST localhost:8788/api/agentpay/agent/pay-service \
 # 1. schema (additive, IF NOT EXISTS) + worker
 cd worker
 npm run db:apply          # wrangler d1 execute entangleit --file=schema.sql --remote
+# Additive column migration (existing D1 only; skip on a fresh schema.sql apply):
+npx wrangler d1 execute entangleit --file=migrations/2026-10-20-ap-sends-wallet-dest.sql --remote
 npx wrangler deploy       # attaches entangleit.com/api/agentpay/*
 
 # 2. frontend: portfolio build first (wipes public/), then merges
@@ -280,6 +282,7 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 | `GET /services` · `GET /services/:id` · `GET /services/:id/quote?tool=` | — | x402market discovery + live 402 quote |
 | `GET /agent/me` | `agp_` | Balance + agent identity |
 | `POST /agent/spend` | `agp_` | Debit + receipt |
+| `POST /agent/send` | `agp_` | Pay a BSV P2PKH address (on-chain, `settlement: live`) or an agentpay wallet id `apw_…` (internal ledger, `settlement: internal`) |
 | `POST /agent/topup-link` | `agp_` | Checkout URL to hand to a human |
 | `POST /agent/pay-service` | `agp_` | Quote, charge, settle x402 on BSV, return seller result |
 | `POST /agent/chat` | `agp_` | Pay-per-call Fuse LLM (no API key); returns completion + receipt + txid |
@@ -308,13 +311,13 @@ setup, `GOOGLE_CLIENT_ID` configuration, schema migration, and security notes.
 
 `health` · `get_balance` · `create_topup_link` · `create_upgrade_link` ·
 `mint_subagent` · `list_subagents` · `revoke_subagent` · `get_attestation` ·
-`list_services` · `service_quote` · `spend` · `pay_service` · `chat` · `extract` · `get_receipt` ·
+`list_services` · `service_quote` · `spend` · `send` · `pay_service` · `chat` · `extract` · `get_receipt` ·
 `list_transactions` · `list_bounties` · `get_bounty` · `claim_bounty` ·
 `submit_work` · `my_bounties` · `post_bounty` · `settle_bounty` · `my_escrows`
 
 Public tools need no auth. Wallet tools take the agent key as
 `Authorization: Bearer agp_…` on the MCP connection or as the `key` parameter.
-`spend`, `pay_service`, `chat`, and `extract` accept `approvalId`; when an agent's policy threshold
+`spend`, `send`, `pay_service`, `chat`, and `extract` accept `approvalId`; when an agent's policy threshold
 is crossed they return 402 `approval_required` with an approval URL, and the
 retry settles once a human approves.
 
@@ -340,7 +343,7 @@ Cursor / any MCP client:
 - Every spend = ledger event + receipt; every top-up = ledger event; failed x402 = one refund keyed by receipt id.
 - x402 payloads carry the full v2 envelope; signed txs attach their parent tx; the seller broadcasts via ARC (agentpay never broadcasts).
 - x402 buys only confirmed UTXOs, never reuses a txid (random OP_RETURN nonce), and refunds exactly once per charge (refund keyed by receipt id, replay guard on settled txids).
-- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `pay_service`, `chat`, and `extract`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
+- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `send`, `pay_service`, `chat`, and `extract`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
 
 ## Treasury operations
 
@@ -352,6 +355,19 @@ plus the flat fee (30 sats default), so 5,000 sats ≈ 125 calls of headroom.
 - Secrets (`STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `SITE_WALLET_WIF`) never in git; production never charges test mode.
 
 ## Agent economy primitives
+
+**Direct send (`POST /agent/send`, MCP `send`).** An agent key (`agp_…`) pays
+`sats` to `dest`, which is either a BSV P2PKH address or a public agentpay
+wallet id (`apw_…` from `GET /agent/me`, never the secret wallet token).
+
+- P2PKH → treasury broadcasts on-chain. `settlement: "live"`, `txid` is a BSV
+  transaction. Spent-outpoint ledger and no-unconfirmed-change rules apply.
+- `apw_…` → internal ledger transfer (debit sender cents, credit dest cents at
+  the same sats→cents rate). `settlement: "internal"`, `txid` and `receiptId`
+  are the send id. No treasury UTXO is spent. Unknown dest → 404, frozen dest →
+  403, self-send → 400.
+- Idempotent per `(wallet_id, idempotency_key)`. Daily limits, allowlists
+  (`spend` / `agent_send` / `*`), and `approvalAboveCents` apply.
 
 **Sub-agent budgets (delegation).** A top-level agent mints scoped child keys —
 own lifetime budget, expiry, daily limit, tool allowlist — and can list/revoke

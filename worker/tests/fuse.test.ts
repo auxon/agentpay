@@ -314,12 +314,12 @@ describe("Fuse chat input", () => {
 });
 
 describe("MCP surface", () => {
-  it("advertises chat and extract at version 0.3.0 on the agent card and llms.txt", async () => {
+  it("advertises chat and extract at version 0.3.1 on the agent card and llms.txt", async () => {
     const db = makeTestDb();
     const card = await jsonOf(await req("/api/agentpay/agent-card", db, { method: "GET" }));
     expect(card.status).toBe(200);
-    expect(card.body.version).toBe("0.3.0");
-    expect(card.body.tools).toEqual(expect.arrayContaining(["chat", "extract", "pay_service"]));
+    expect(card.body.version).toBe("0.3.1");
+    expect(card.body.tools).toEqual(expect.arrayContaining(["chat", "extract", "pay_service", "send"]));
     const llms = await req("/api/agentpay/llms.txt", db, { method: "GET" });
     expect(llms.status).toBe(200);
     const text = await llms.text();

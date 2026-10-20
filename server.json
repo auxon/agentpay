@@ -3,7 +3,7 @@
   "name": "com.entangleit/agentpay",
   "title": "agentpay — card-funded wallets for AI agents",
   "description": "Pay-per-call LLM + extract (no API key), prepaid wallets, scoped keys, BSV x402 MCP.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "remotes": [
     {
       "type": "streamable-http",
@@ -11,7 +11,7 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Agent key: Bearer agp_… (mint one at entangleit.com/agentpay). Optional — list_services, service_quote, and claim_trial are public. chat and extract need a key.",
+          "description": "Agent key: Bearer agp_… (mint one at entangleit.com/agentpay). Optional — list_services, service_quote, and claim_trial are public. chat, extract, and send need a key.",
           "isRequired": false,
           "isSecret": true
         }

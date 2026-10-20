@@ -336,6 +336,11 @@ export function agentSpendAllowed(allowed: string[]): boolean {
   return allowed.length === 0 || allowed.includes("*") || allowed.includes("spend");
 }
 
+/** Allowlist for POST /agent/send. Empty / * = all; also accepts spend or agent_send. */
+export function agentSendAllowed(allowed: string[]): boolean {
+  return allowed.length === 0 || allowed.includes("*") || allowed.includes("spend") || allowed.includes("agent_send");
+}
+
 /** Allowlist for the dedicated Fuse `chat` tool. Empty / * = all. */
 export function agentChatAllowed(allowed: string[], model: string): boolean {
   if (allowed.length === 0) return true;
@@ -553,6 +558,89 @@ export async function creditTopup(
     .run();
 
   return { credited: true, amountCents, balanceCents, ledgerId };
+}
+
+/**
+ * Credit a wallet for an internal send (apw_ destination). Does not bump
+ * lifetime_topup_cents (that is card/Stripe only). Idempotent by ref via
+ * ap_topup_refs so a retried send cannot double-credit the destination.
+ */
+export async function creditInternalTransfer(
+  db: D1Database,
+  input: {
+    destWalletId: string;
+    amountCents: number;
+    ref: string;
+    fromWalletId: string;
+    sendId: string;
+    sats: number;
+    memo?: string;
+  },
+): Promise<{ credited: boolean; ledgerId: string; balanceCents: number }> {
+  const { destWalletId, amountCents, ref } = input;
+  if (!Number.isInteger(amountCents) || amountCents <= 0) {
+    throw new HttpError(400, "Invalid transfer amount");
+  }
+  if (!ref) throw new HttpError(400, "Transfer ref is required");
+
+  const dest = await db
+    .prepare("SELECT id, status FROM ap_wallets WHERE id = ?")
+    .bind(destWalletId)
+    .first<{ id: string; status: string }>();
+  if (!dest) throw new HttpError(404, "Unknown destination wallet");
+  if (dest.status !== "active") throw new HttpError(403, "Destination wallet is frozen");
+
+  const claimed = await db
+    .prepare("INSERT OR IGNORE INTO ap_topup_refs (ref, wallet_id, amount_cents, created_at) VALUES (?, ?, ?, ?)")
+    .bind(ref, destWalletId, amountCents, nowIso())
+    .run();
+  if ((claimed.meta?.changes ?? 0) === 0) {
+    const existing = await db
+      .prepare("SELECT id, balance_after_cents FROM ap_ledger WHERE wallet_id = ? AND kind = 'adjust' AND ref = ? LIMIT 1")
+      .bind(destWalletId, ref)
+      .first<{ id: string; balance_after_cents: number }>();
+    return {
+      credited: false,
+      ledgerId: existing?.id ?? "",
+      balanceCents: existing?.balance_after_cents ?? (await getBalanceCents(db, destWalletId)),
+    };
+  }
+
+  const credit = await db
+    .prepare("UPDATE ap_wallets SET balance_cents = balance_cents + ?, updated_at = ? WHERE id = ? AND status = 'active'")
+    .bind(amountCents, nowIso(), destWalletId)
+    .run();
+  if ((credit.meta?.changes ?? 0) !== 1) {
+    await db.prepare("DELETE FROM ap_topup_refs WHERE ref = ?").bind(ref).run();
+    throw new HttpError(403, "Destination wallet is frozen");
+  }
+
+  const balanceCents = await getBalanceCents(db, destWalletId);
+  const ledgerId = newId("apl");
+  await db
+    .prepare(
+      `INSERT INTO ap_ledger (id, wallet_id, agent_id, kind, amount_cents, balance_after_cents, currency, ref, meta_json, created_at)
+       VALUES (?, ?, NULL, 'adjust', ?, ?, 'usd', ?, ?, ?)`,
+    )
+    .bind(
+      ledgerId,
+      destWalletId,
+      amountCents,
+      balanceCents,
+      ref,
+      JSON.stringify({
+        type: "internal_transfer",
+        fromWalletId: input.fromWalletId,
+        sendId: input.sendId,
+        sats: input.sats,
+        memo: cleanStr(input.memo, DESCRIPTION_MAX),
+        description: "Internal wallet transfer",
+      }),
+      nowIso(),
+    )
+    .run();
+
+  return { credited: true, ledgerId, balanceCents };
 }
 
 export interface SpendInput {

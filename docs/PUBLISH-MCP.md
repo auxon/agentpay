@@ -1,8 +1,8 @@
 # MCP Registry publishing — agentpay
 
 **Status: PUBLISHED.** `com.entangleit/agentpay` v0.1.0 is live in the official
-registry (namespace verified for `entangleit.com`). This repo is at **v0.3.0**
-(pay-per-call LLM + extract / standard x402 v2 `accepts[]`); republish when deploying:
+registry (namespace verified for `entangleit.com`). This repo is at **v0.3.1**
+(pay-per-call LLM + extract + `send` to `apw_…` wallets / standard x402 v2 `accepts[]`); republish when deploying:
 
 ```bash
 curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=com.entangleit/agentpay"

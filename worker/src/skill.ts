@@ -52,6 +52,8 @@ Returns the completion, \`receiptUrl\`, and on-chain \`txid\`. Pass \`dryRun: tr
 3. \`pay_service {serviceId, tool, params}\` — quotes, settles on BSV (legacy single-object *or* standard v2 \`accepts[]\`; BSV exact only), returns the seller result + txid. Pass \`dryRun: true\` to price without spending.
 4. Every debit writes a receipt (\`get_receipt\`, \`list_transactions\`).
 
+\`send {dest, sats, idempotency_key}\` pays a BSV P2PKH address on-chain (\`settlement: live\`, \`txid\` is a BSV tx) or an agentpay wallet id \`apw_…\` as an internal ledger credit (\`settlement: internal\`, \`txid\` is a receipt id). Pass the public wallet id from \`get_balance\` / \`/agent/me\`, never the secret token. Allowlist: \`spend\`, \`agent_send\`, or \`*\`.
+
 Spending rules: scoped keys never withdraw. Daily limits and tool allowlists fail closed. Spends at/above \`approvalAboveCents\` return 402 \`approval_required\` with an approval URL — a human approves, you retry with \`approvalId\`.
 
 ## Earn
@@ -109,5 +111,6 @@ Fuse: https://entangleit.com/fuse/v1/extract
 ## Other spend
 
 - \`list_services\` / \`service_quote\` / \`pay_service\` — x402market registry (legacy single-object *and* standard v2 \`accepts[]\` BSV challenges).
+- \`send {dest, sats, idempotency_key}\` — pay a BSV P2PKH address on-chain (\`settlement: live\`, \`txid\` is a BSV tx) or an agentpay wallet id \`apw_…\` as an internal ledger credit (\`settlement: internal\`, \`txid\` is a receipt id). Pass the public wallet id from \`get_balance\` / \`/agent/me\`, never the secret token. Daily limits, allowlists (\`spend\` or \`agent_send\`), and approvals apply.
 - Wallet limits, scoped keys, and claim_trial budgets are enforced on every debit.
 `;

@@ -24,10 +24,12 @@ import {
 import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
   agentFuseAllowed,
+  agentSendAllowed,
   agentSpendAllowed,
   agentToolAllowed,
   claimX402Txid,
   consumeApproval,
+  creditInternalTransfer,
   createAgent,
   createApproval,
   createSubagent,
@@ -132,6 +134,7 @@ import {
   getLink,
   handleBountyEvent,
   isValidBsvAddress,
+  parseSendDest,
   linkBounty,
   listBounties,
   listEscrowRows,
@@ -370,6 +373,10 @@ async function gateSpend(
   } else if (input.serviceId && input.toolName) {
     if (!agentToolAllowed(allowed, input.serviceId, input.toolName)) {
       throw new HttpError(403, `Tool ${input.serviceId}:${input.toolName} is not in this agent's allowlist`);
+    }
+  } else if (input.toolLabel === "agent_send") {
+    if (!agentSendAllowed(allowed)) {
+      throw new HttpError(403, "This agent's allowlist does not permit send");
     }
   } else if (!agentSpendAllowed(allowed)) {
     throw new HttpError(403, "This agent's allowlist does not permit generic spend");
@@ -916,7 +923,7 @@ api.patch("/wallets/me/agents/:id/policy", async (c) => {
   });
   return c.json({
     policy: publicPolicy(policy),
-    note: "allowedTools entries look like serviceId:tool or serviceId:* (empty = all); generic spend needs \"spend\" or \"*\".",
+    note: "allowedTools entries look like serviceId:tool or serviceId:* (empty = all); generic spend needs \"spend\" or \"*\"; send needs \"spend\", \"agent_send\", or \"*\".",
   });
 });
 
@@ -2144,11 +2151,54 @@ api.get("/agent/receipts/:id", async (c) => {
   return c.json({ receipt: publicReceipt(receipt) });
 });
 
-// ---------- Direct BSV send (POST /agent/send) ----------
+// ---------- Direct send (POST /agent/send) ----------
 //
-// Agent-initiated BSV send from the treasury, debited against the agent's
-// wallet balance. Idempotent per (wallet_id, idempotency_key): a retry with
-// the same key returns the original txid instead of broadcasting again.
+// dest is either a BSV P2PKH address (treasury broadcasts on-chain,
+// settlement=live, txid is a BSV tx) or an agentpay wallet id apw_…
+// (internal ledger transfer, settlement=internal, txid is the send id).
+// Idempotent per (wallet_id, idempotency_key). Daily limits, allowlists,
+// and approval thresholds apply. Does not spend unconfirmed change or
+// touch the spent-outpoint ledger on the internal path.
+
+type SendRow = {
+  id: string;
+  txid: string | null;
+  status: string;
+  sats: number;
+  dest: string;
+  settlement: string | null;
+};
+
+function sendResponse(row: { settlement?: string | null; txid: string; dest: string; sats: number }) {
+  const settlement = row.settlement === "internal" ? "internal" : "live";
+  return {
+    ok: true as const,
+    settlement,
+    txid: row.txid,
+    dest: row.dest,
+    sats: row.sats,
+    ...(settlement === "internal" ? { receiptId: row.txid } : {}),
+  };
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /UNIQUE/i.test(msg) || /constraint failed/i.test(msg);
+}
+
+async function loadSendByIdempotency(
+  db: D1Database,
+  walletId: string,
+  key: string,
+): Promise<SendRow | null> {
+  return db
+    .prepare(
+      "SELECT id, txid, status, sats, dest, settlement FROM ap_sends WHERE wallet_id = ? AND idempotency_key = ?",
+    )
+    .bind(walletId, key)
+    .first<SendRow>();
+}
+
 api.post("/agent/send", async (c) => {
   const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
   const body = (await c.req.json().catch(() => ({}))) as {
@@ -2156,60 +2206,130 @@ api.post("/agent/send", async (c) => {
     sats?: unknown;
     memo?: unknown;
     idempotency_key?: unknown;
+    approvalId?: unknown;
   };
 
-  const dest = cleanStr(body.dest, 100);
-  if (!dest || !isValidBsvAddress(dest)) {
-    throw new HttpError(400, "dest must be a valid BSV P2PKH address");
-  }
+  const parsed = parseSendDest(body.dest);
+  const dest = parsed.dest;
   const sats = Math.floor(Number(body.sats));
   if (!Number.isInteger(sats) || sats <= 0) {
     throw new HttpError(400, "sats must be a positive integer");
   }
   const memo = cleanStr(body.memo, 200) || "";
   const idempotencyKey = cleanStr(body.idempotency_key, 120) || null;
+  const approvalId = cleanStr(body.approvalId, 80);
+  const settlement = parsed.kind === "wallet" ? "internal" : "live";
 
-  // Idempotency: return the original result if this key was seen.
   if (idempotencyKey) {
-    const prior = await c.env.DB.prepare(
-      "SELECT txid, status, sats, dest FROM ap_sends WHERE wallet_id = ? AND idempotency_key = ?",
-    )
-      .bind(wallet.id, idempotencyKey)
-      .first<{ txid: string | null; status: string; sats: number; dest: string }>();
+    const prior = await loadSendByIdempotency(c.env.DB, wallet.id, idempotencyKey);
     if (prior) {
       if (prior.status === "complete" && prior.txid) {
-        return c.json({ ok: true, settlement: "live", txid: prior.txid, dest: prior.dest, sats: prior.sats });
+        return c.json(sendResponse({ ...prior, txid: prior.txid }));
       }
-      throw new HttpError(409, "A send with this idempotency key is already in progress");
+      // Failed internal sends refunded the debit, so a retry may reuse the row.
+      // Failed live sends leave the debit in place — do not broadcast again.
+      if (prior.status !== "failed" || prior.settlement !== "internal") {
+        throw new HttpError(409, "A send with this idempotency key is already in progress");
+      }
     }
   }
 
-  const wif = c.env.SITE_WALLET_WIF?.trim();
-  if (!wif) throw new HttpError(503, "BSV treasury is not configured (SITE_WALLET_WIF missing)");
+  let destWalletId: string | null = null;
+  if (parsed.kind === "wallet") {
+    if (dest === wallet.id) {
+      throw new HttpError(400, "Cannot send to your own wallet");
+    }
+    const destWallet = await c.env.DB.prepare("SELECT id, status FROM ap_wallets WHERE id = ?")
+      .bind(dest)
+      .first<{ id: string; status: string }>();
+    if (!destWallet) throw new HttpError(404, "Unknown destination wallet");
+    if (destWallet.status !== "active") throw new HttpError(403, "Destination wallet is frozen");
+    destWalletId = destWallet.id;
+  }
 
-  // Debit the agent's wallet (cents) for the sats being sent.
+  if (parsed.kind === "p2pkh") {
+    const wif = c.env.SITE_WALLET_WIF?.trim();
+    if (!wif) throw new HttpError(503, "BSV treasury is not configured (SITE_WALLET_WIF missing)");
+  }
+
   const { resolveSatsPerCent } = await import("./price");
   const { perCent } = await resolveSatsPerCent(c.env, c.env.DB, satsPerCent(c.env));
   const amountCents = chargeCentsForSats(sats, c.env, perCent);
+  const description = memo || `Direct send: ${sats} sats to ${dest.slice(0, 12)}…`;
 
-  const sendId = newId("snd");
-  await c.env.DB.prepare(
-    `INSERT INTO ap_sends (id, wallet_id, agent_id, dest, sats, memo, idempotency_key, status, charged_cents)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
-  )
-    .bind(sendId, wallet.id, agent.id, dest, sats, memo, idempotencyKey, amountCents)
-    .run();
+  const gate = await gateSpend(c, {
+    wallet,
+    agent,
+    amountCents,
+    description,
+    ref: idempotencyKey || dest,
+    approvalId,
+    toolLabel: "agent_send",
+    serviceLabel: "agentpay",
+  });
+  if (gate && "response" in gate) return gate.response;
 
+  const existingFailed =
+    idempotencyKey != null ? await loadSendByIdempotency(c.env.DB, wallet.id, idempotencyKey) : null;
+  let sendId: string;
+  if (existingFailed?.status === "failed" && existingFailed.settlement === "internal") {
+    sendId = existingFailed.id;
+    await c.env.DB.prepare(
+      `UPDATE ap_sends
+       SET dest = ?, sats = ?, memo = ?, charged_cents = ?, settlement = ?, dest_wallet_id = ?,
+           status = 'pending', txid = NULL, completed_at = NULL, agent_id = ?
+       WHERE id = ? AND status = 'failed'`,
+    )
+      .bind(dest, sats, memo, amountCents, settlement, destWalletId, agent.id, sendId)
+      .run();
+  } else {
+    sendId = newId("snd");
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO ap_sends (id, wallet_id, agent_id, dest, sats, memo, idempotency_key, status, charged_cents, settlement, dest_wallet_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      )
+        .bind(sendId, wallet.id, agent.id, dest, sats, memo, idempotencyKey, amountCents, settlement, destWalletId)
+        .run();
+    } catch (err) {
+      if (idempotencyKey && isUniqueConstraintError(err)) {
+        const raced = await loadSendByIdempotency(c.env.DB, wallet.id, idempotencyKey);
+        if (raced?.status === "complete" && raced.txid) {
+          return c.json(sendResponse({ ...raced, txid: raced.txid }));
+        }
+        throw new HttpError(409, "A send with this idempotency key is already in progress");
+      }
+      throw err;
+    }
+  }
+
+  if (gate && "consume" in gate) {
+    try {
+      await consumeGate(c, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        approvalId,
+        amountCents,
+        service: "agentpay",
+        tool: "agent_send",
+      });
+    } catch (err) {
+      await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
+      throw err;
+    }
+  }
+
+  let spendResult: Awaited<ReturnType<typeof spend>>;
   try {
-    await spend(c.env.DB, {
+    spendResult = await spend(c.env.DB, {
       walletId: wallet.id,
       agent,
       amountCents,
-      description: memo || `Direct send: ${sats} sats to ${dest.slice(0, 12)}…`,
+      description,
       service: "agentpay",
       tool: "agent_send",
       ref: `send:${sendId}`,
-      meta: { sats, dest, idempotencyKey },
+      meta: { sats, dest, idempotencyKey, settlement },
     });
   } catch (err) {
     await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
@@ -2217,21 +2337,49 @@ api.post("/agent/send", async (c) => {
   }
 
   let txid: string;
-  try {
-    const tx = await buildDirectSendTx({
-      env: c.env,
-      treasuryKey: PrivateKey.fromWif(wif),
-      dest,
-      satoshis: sats,
-      marker: `agentpay:send:${sendId}`,
-    });
-    const broadcast = await arcBroadcastTx(c.env, tx.toHex());
-    txid = broadcast.txid || tx.id("hex");
-  } catch (err) {
-    // Broadcast failed: the ledger debit stands (funds are accounted), but
-    // mark the send failed so a retry with the same idempotency key can proceed.
-    await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
-    throw err;
+  if (parsed.kind === "wallet" && destWalletId) {
+    try {
+      await creditInternalTransfer(c.env.DB, {
+        destWalletId,
+        amountCents,
+        ref: `send:${sendId}`,
+        fromWalletId: wallet.id,
+        sendId,
+        sats,
+        memo,
+      });
+    } catch (err) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `send:${sendId}:refund`,
+        description: "Internal send credit failed",
+        receiptId: spendResult.receipt.id,
+      });
+      await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
+      throw err;
+    }
+    txid = sendId;
+  } else {
+    const wif = c.env.SITE_WALLET_WIF?.trim();
+    if (!wif) throw new HttpError(503, "BSV treasury is not configured (SITE_WALLET_WIF missing)");
+    try {
+      const tx = await buildDirectSendTx({
+        env: c.env,
+        treasuryKey: PrivateKey.fromWif(wif),
+        dest,
+        satoshis: sats,
+        marker: `agentpay:send:${sendId}`,
+      });
+      const broadcast = await arcBroadcastTx(c.env, tx.toHex());
+      txid = broadcast.txid || tx.id("hex");
+    } catch (err) {
+      // Broadcast failed: the ledger debit stands (funds are accounted).
+      // Do not reuse this idempotency key — a retry would double-spend the debit.
+      await c.env.DB.prepare("UPDATE ap_sends SET status = 'failed' WHERE id = ?").bind(sendId).run();
+      throw err;
+    }
   }
 
   await c.env.DB.prepare(
@@ -2240,7 +2388,8 @@ api.post("/agent/send", async (c) => {
     .bind(txid, sendId)
     .run();
 
-  return c.json({ ok: true, settlement: "live", txid, dest, sats });
+  c.executionCtx.waitUntil(afterSpend(c, wallet, spendResult));
+  return c.json(sendResponse({ settlement, txid, dest, sats }));
 });
 
 // ---------- BSVBounties bridge (earn side) ----------
