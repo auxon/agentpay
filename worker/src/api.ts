@@ -23,7 +23,7 @@ import {
 } from "./types";
 import { requireAgent, requireWallet, mintWalletToken, WALLET_TOKEN_PREFIX } from "./auth";
 import {
-  agentChatAllowed,
+  agentFuseAllowed,
   agentSpendAllowed,
   agentToolAllowed,
   claimX402Txid,
@@ -107,13 +107,19 @@ import {
 import { callServiceTool, getService, listServices, quoteService, registryAvailable } from "./registry";
 import {
   FUSE_DOCS_URL,
+  FUSE_EXTRACT_MODEL,
   FUSE_MODELS,
   FUSE_PUBLIC_CHAT_URL,
+  FUSE_PUBLIC_EXTRACT_URL,
   FUSE_SERVICE_ID,
   callFuseChatPaid,
+  callFuseExtractPaid,
   fuseBindingConfigured,
   parseFuseChatBody,
+  parseFuseExtractBody,
+  parseFuseExtractResult,
   quoteFuseChat,
+  quoteFuseExtract,
 } from "./fuse";
 import { applyTrustMultiplier, decidePayTrust, fetchReputation, resolveBountyAccount, trustPayMode } from "./trust";
 import { getCachedBsvUsd } from "./price";
@@ -357,8 +363,9 @@ async function gateSpend(
   const policy = await getAgentPolicy(c.env.DB, input.agent.id);
   const allowed = parseAllowedTools(policy.allowed_tools_json);
   if (input.serviceId === FUSE_SERVICE_ID) {
-    if (!agentChatAllowed(allowed, input.toolName ?? "chat")) {
-      throw new HttpError(403, `Tool fuse:${input.toolName ?? "chat"} is not in this agent's allowlist`);
+    const fuseTool = input.toolName ?? "chat";
+    if (!agentFuseAllowed(allowed, fuseTool)) {
+      throw new HttpError(403, `Tool fuse:${fuseTool} is not in this agent's allowlist`);
     }
   } else if (input.serviceId && input.toolName) {
     if (!agentToolAllowed(allowed, input.serviceId, input.toolName)) {
@@ -535,8 +542,9 @@ api.get("/health", async (c) => {
     },
     fuse: {
       chat: FUSE_PUBLIC_CHAT_URL,
+      extract: FUSE_PUBLIC_EXTRACT_URL,
       binding: fuseBindingConfigured(env),
-      models: [...FUSE_MODELS],
+      models: [...FUSE_MODELS, FUSE_EXTRACT_MODEL],
       docs: FUSE_DOCS_URL,
     },
   });
@@ -678,6 +686,7 @@ api.get("/start", async (c) => {
       { n: 5, title: "Dry-run a paid call (no charge)", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", dryRun: true }, note: "Returns quote + would-be charge + trust evaluation without debiting" },
       { n: 6, title: "Spend for real", tool: "pay_service", body: { serviceId: "<id>", tool: "<tool>", params: {} } },
       { n: 7, title: "Pay-per-call LLM (no API key)", tool: "chat", body: { model: "fuse-fast", messages: [{ role: "user", content: "ping" }] }, note: "Settles Fuse's standard x402 v2 402 from the wallet; returns the completion + txid" },
+      { n: 8, title: "Extract typed fields (no API key)", tool: "extract", body: { state: "Total $12.50 on Oct 1", fields: { total: { type: "number" } } }, note: "Pays Fuse extract; returns answers with confidence/nulls + receipt + txid" },
     ],
     mcp: `${PUBLIC_SITE}${MCP_PATH}`,
     docs: `${PUBLIC_SITE}/agentpay/docs/`,
@@ -708,6 +717,7 @@ api.get("/agent-card", async (c) => {
       bondDiscount: "claim_bounty {attestation, attestationSignature} → 50% worker bond off when eligible",
       sandbox: "pay_service {dryRun:true} → quote + policy check, no charge",
       chat: "chat {model, messages} → pay-per-call Fuse LLM, no API key, receipt + txid",
+      extract: "extract {state, fields} → typed values from messy text/receipts (confidence + nulls), receipt + txid",
     },
     starter: `${PUBLIC_SITE}${API_PREFIX}/start`,
   });
@@ -1891,6 +1901,230 @@ api.post("/agent/chat", async (c) => {
     quote: quote.raw,
     satoshis: requirements.satoshis,
     model: chat.model,
+    settlement: "wallet",
+    note: "Site wallet WIF is not configured, so no on-chain payment was made. Configure SITE_WALLET_WIF to settle x402 challenges.",
+  });
+});
+
+/**
+ * Pay-per-call Fuse extract. Quotes the standard x402 v2 402 (S/M/L from
+ * request size), settles BSV from the site wallet, and returns typed answers
+ * plus receipt + txid. No Fuse key. Wallet limits still apply.
+ */
+api.post("/agent/extract", async (c) => {
+  const { agent, wallet } = await requireAgent(c.req.raw, c.env.DB);
+  const body = (await c.req.json().catch(() => ({}))) as {
+    state?: unknown;
+    fields?: unknown;
+    reference_date?: unknown;
+    referenceDate?: unknown;
+    images?: unknown;
+    amountCents?: unknown;
+    description?: unknown;
+    ref?: unknown;
+    approvalId?: unknown;
+    dryRun?: unknown;
+  };
+  const extract = parseFuseExtractBody(body);
+  const description = cleanStr(body.description, 200) || `extract ${FUSE_EXTRACT_MODEL}`;
+  const ref = cleanStr(body.ref, 120);
+  const approvalId = cleanStr(body.approvalId, 80);
+
+  const quote = await quoteFuseExtract(c.env, extract);
+  const requirements = quote.requirements;
+  const size = quote.size ?? null;
+  const { resolveSatsPerCent } = await import("./price");
+  const quoteRate = await resolveSatsPerCent(
+    c.env,
+    c.env.DB,
+    Number(String(c.env.X402_SATS_PER_CENT ?? "")) || 0 || 40_000,
+  );
+  const amountCents = chargeCentsFor(requirements.satoshis, c.env, body.amountCents, quoteRate.perCent);
+
+  if (body.dryRun === true) {
+    return c.json({
+      dryRun: true,
+      model: FUSE_EXTRACT_MODEL,
+      size,
+      satoshis: requirements.satoshis,
+      payTo: requirements.payTo,
+      chargedCents: amountCents,
+      quote: quote.raw,
+      note: "Dry run — nothing was debited or settled. Omit dryRun to execute.",
+    });
+  }
+
+  const gate = await gateSpend(c, {
+    wallet,
+    agent,
+    amountCents,
+    description,
+    ref,
+    approvalId,
+    serviceId: FUSE_SERVICE_ID,
+    toolName: FUSE_EXTRACT_MODEL,
+    serviceLabel: "fuse",
+    toolLabel: FUSE_EXTRACT_MODEL,
+  });
+  if (gate && "response" in gate) return gate.response;
+
+  if (siteWalletConfigured(c.env)) {
+    const prepared = await prepareBsvPayment(c.env, requirements);
+    if (gate && "consume" in gate) {
+      await consumeGate(c, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        approvalId,
+        amountCents,
+        service: "fuse",
+        tool: FUSE_EXTRACT_MODEL,
+      });
+    }
+    const charged = await spend(c.env.DB, {
+      walletId: wallet.id,
+      agent,
+      amountCents,
+      description,
+      service: "fuse",
+      tool: FUSE_EXTRACT_MODEL,
+      ref,
+      meta: {
+        settlement: "bsv",
+        payTo: requirements.payTo,
+        satoshis: requirements.satoshis,
+        satsPerCent: quoteRate.perCent,
+        priceSource: quoteRate.source,
+        txid: prepared.txid,
+        model: FUSE_EXTRACT_MODEL,
+        size,
+      },
+    });
+
+    let res: Response;
+    try {
+      res = await callFuseExtractPaid(c.env, extract, prepared.paymentSignature);
+    } catch (e) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: "fuse extract unreachable",
+        receiptId: charged.receipt.id,
+      });
+      throw e instanceof HttpError
+        ? e
+        : new HttpError(502, `Fuse unreachable after signing payment: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+    }
+
+    const paymentResponse = res.headers.get("PAYMENT-RESPONSE");
+    const fuseReceiptHeader = res.headers.get("X-Fuse-Receipt");
+    const seller = await sellerResponse(res);
+    const settled = seller.status < 400 || Boolean(paymentResponse);
+    if (!settled) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: `fuse extract rejected (${seller.status})`,
+        receiptId: charged.receipt.id,
+      });
+      throw new HttpError(
+        seller.status === 402 ? 402 : 502,
+        `Fuse rejected x402 payment (${seller.status}): ${seller.body.slice(0, 200)}`,
+      );
+    }
+
+    const claimed = await claimX402Txid(c.env.DB, {
+      txid: prepared.txid,
+      walletId: wallet.id,
+      service: "fuse",
+      tool: FUSE_EXTRACT_MODEL,
+      receiptId: charged.receipt.id,
+    });
+    if (!claimed) {
+      await refundSpend(c.env.DB, {
+        walletId: wallet.id,
+        agentId: agent.id,
+        amountCents,
+        ref: `refund:${charged.receipt.id}`,
+        description: "duplicate x402 txid (seller replay)",
+        receiptId: charged.receipt.id,
+      });
+      throw new HttpError(502, "Seller returned an already-settled txid — the debit was refunded");
+    }
+
+    c.executionCtx.waitUntil(afterSpend(c, wallet, charged));
+    c.executionCtx.waitUntil(
+      treasuryStatus(c.env.DB, c.env)
+        .then((t) => maybeAlertTreasury(c.env, c.env.DB, t))
+        .catch(() => {}),
+    );
+
+    let extraction: unknown = null;
+    if (seller.contentType.includes("json") && seller.body) {
+      try {
+        extraction = JSON.parse(seller.body) as unknown;
+      } catch {
+        extraction = null;
+      }
+    }
+    const parsed = parseFuseExtractResult(extraction);
+    const receipt = publicReceipt(charged.receipt);
+    return c.json({
+      answers: parsed.answers,
+      size: parsed.size ?? size,
+      model: parsed.model,
+      usage: parsed.usage,
+      extraction,
+      receipt,
+      receiptUrl: `${PUBLIC_SITE}${API_PREFIX}/agent/receipts/${receipt.id}`,
+      receiptPage: `${PUBLIC_SITE}${APP_PREFIX}/`,
+      balanceCents: charged.balanceCents,
+      agentSpentTodayCents: charged.agentSpentTodayCents,
+      settlement: "bsv",
+      network: "bsv:mainnet",
+      txid: prepared.txid,
+      explorerUrl: `https://whatsonchain.com/tx/${prepared.txid}`,
+      satoshis: requirements.satoshis,
+      payTo: requirements.payTo,
+      chargedCents: amountCents,
+      fuseReceipt: fuseReceiptHeader || parsed.receipt || null,
+      paymentResponse: paymentResponse ? safeParseB64(paymentResponse) : null,
+    });
+  }
+
+  if (gate && "consume" in gate) {
+    await consumeGate(c, {
+      walletId: wallet.id,
+      agentId: agent.id,
+      approvalId,
+      amountCents,
+      service: "fuse",
+      tool: FUSE_EXTRACT_MODEL,
+    });
+  }
+  const result = await spend(c.env.DB, {
+    walletId: wallet.id,
+    agent,
+    amountCents,
+    description,
+    service: "fuse",
+    tool: FUSE_EXTRACT_MODEL,
+    ref,
+    meta: { settlement: "wallet", satoshis: requirements.satoshis, model: FUSE_EXTRACT_MODEL, size },
+  });
+  c.executionCtx.waitUntil(afterSpend(c, wallet, result));
+  return c.json({
+    receipt: publicReceipt(result.receipt),
+    receiptUrl: `${PUBLIC_SITE}${API_PREFIX}/agent/receipts/${result.receipt.id}`,
+    balanceCents: result.balanceCents,
+    agentSpentTodayCents: result.agentSpentTodayCents,
+    quote: quote.raw,
+    satoshis: requirements.satoshis,
+    size,
+    model: FUSE_EXTRACT_MODEL,
     settlement: "wallet",
     note: "Site wallet WIF is not configured, so no on-chain payment was made. Configure SITE_WALLET_WIF to settle x402 challenges.",
   });

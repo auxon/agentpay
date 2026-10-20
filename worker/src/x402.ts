@@ -31,7 +31,8 @@ export const BSV_ASSET_LEGACY = "native:BSV";
 /** Standard x402 v2 BSV asset id (Fuse and the x402 spec). */
 export const BSV_ASSET = "BSV";
 export const P2PKH_RAWTX = "p2pkh-rawtx";
-export const DEFAULT_MAX_PAYMENT_SATS = 10_000;
+/** High enough for Fuse extract L (50,000 sats). Operators can lower this. */
+export const DEFAULT_MAX_PAYMENT_SATS = 50_000;
 /** ARC/GorillaPool enforces a relay minimum the SDK fee model undershoots. */
 export const DEFAULT_FEE_SATS = 30;
 export const DUST_CHANGE_SATS = 2;

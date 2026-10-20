@@ -3,7 +3,8 @@
 Prepaid USD wallets, budgets, and MCP payment tools for AI agents on Cloudflare.
 A human funds a wallet with a card through Stripe Checkout; agents get scoped
 keys, optional daily limits, and tools to check balance, call a **pay-per-call
-LLM with no API key** (`chat` → Fuse), discover paid services (the
+LLM with no API key** (`chat` → Fuse) or **typed extract** (`extract` → Fuse),
+discover paid services (the
 [x402market](https://entangleit.com/x402market/) registry), spend, and fetch
 receipts. Paid calls settle on **BSV mainnet over x402 v2** from the operator's
 site wallet (legacy single-object challenges and standard `accepts[]`). No
@@ -168,6 +169,23 @@ wallet and returns the completion plus `receiptUrl` and `txid`. Models:
 (`chat` / `fuse:*` / `fuse:<model>`), and `claim_trial` budgets apply. Discovery:
 `https://entangleit.com/fuse/.well-known/x402`.
 
+**Typed extract, no API key.** MCP tool `extract` / `POST /agent/extract` pays
+Fuse's extract endpoint (`https://entangleit.com/fuse/v1/extract`) the same way.
+Use it for structured values from messy text or receipts — typed fields with
+confidence scores and explicit nulls (`p_null`) instead of made-up answers.
+`POST {state, fields, reference_date?, images?}`. `fields` is a name→`{type}`
+object (an array of `{name, type}` is also accepted and converted). Field types:
+`text|number|date|time|datetime|duration|list|estimate|forecast` (lists need
+`items`, e.g. `"text"`). Prepaid tiers: **S** 3,500 sats (≤1,500 chars, ≤8
+fields), **M** 15,000 (≤6,000 chars, ≤30 fields), **L** 50,000 (≤16,000 chars,
+≤30 fields; ~$0.009 — a 50¢ trial can afford it). Images must be base64
+PNG/JPEG/WebP (or data URIs); remote URLs are rejected and image requests are
+at least M. Oversized requests 413 before any 402; bad schema 400. `dryRun` quotes the tier and price without paying. Allowlist: `extract` /
+`fuse:extract` / `fuse:fuse-extract` / `fuse:*`. Per-call sat cap
+(`X402_MAX_SATS`) and wallet/trial budgets still apply. Returns `answers`,
+`receipt`, and `txid`. Fallback URL: `FUSE_EXTRACT_URL`, or the `/extract`
+sibling of `FUSE_CHAT_URL`.
+
 Rail hardening (learned from live mainnet tests):
 
 - **Spent-UTXO filter** — WOC `/unspent` is cached and can list outputs an
@@ -189,13 +207,14 @@ npx wrangler secret put SITE_WALLET_WIF   # BSV treasury (same model as Brainsto
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `SITE_WALLET_WIF` | — | Treasury that pays sellers. Never log or commit. |
-| `X402_MAX_SATS` | `10000` | Per-payment cap; larger asks fail closed. |
+| `X402_MAX_SATS` | `50000` | Per-payment cap (covers Fuse extract L); larger asks fail closed. |
 | `X402_FEE_SATS` | `30` | Flat network fee (ARC/GorillaPool relay min is ~23 for a 225B tx). |
 | `X402_SATS_PER_CENT` | unset | Auto-pricing; unset charges the 1-cent minimum per paid call. |
 | `X402_MIN_TREASURY_SATS` | `5000` | `/health` flags `x402.treasury.low` below this balance. |
 | `X402_ALLOW_UNCONFIRMED` | unset | `1` spends unconfirmed UTXOs (local testing only). |
-| `FUSE` (service binding) | worker `fuse` | Same-zone Worker-to-Worker chat calls (avoids origin 405). |
+| `FUSE` (service binding) | worker `fuse` | Same-zone Worker-to-Worker chat/extract calls (avoids origin 405). |
 | `FUSE_CHAT_URL` | public completions URL | Fetch fallback when the FUSE binding is absent (local / tests). |
+| `FUSE_EXTRACT_URL` | public extract URL | Fetch fallback for extract; else derived from `FUSE_CHAT_URL`. |
 | `TRIAL_CENTS` | `50` | Trial faucet credit. 50¢ ≈ 50 fuse-fast calls at the 1-cent floor (was 25¢). |
 
 Without `SITE_WALLET_WIF`, `pay_service` falls back to internal wallet settlement
@@ -264,6 +283,7 @@ The portfolio `static/_worker.js` has the `/agentpay/` SPA fallback and
 | `POST /agent/topup-link` | `agp_` | Checkout URL to hand to a human |
 | `POST /agent/pay-service` | `agp_` | Quote, charge, settle x402 on BSV, return seller result |
 | `POST /agent/chat` | `agp_` | Pay-per-call Fuse LLM (no API key); returns completion + receipt + txid |
+| `POST /agent/extract` | `agp_` | Pay-per-call Fuse extract (typed fields from text/receipts); returns answers + receipt + txid |
 | `GET /llms.txt` | — | Short machine-readable agent index |
 | `GET /agent/transactions` · `GET /agent/receipts/:id` | `agp_` | History |
 | `GET /bounties` · `GET /bounties/:id` | — | BSVBounties marketplace listings (proxied) |
@@ -288,13 +308,13 @@ setup, `GOOGLE_CLIENT_ID` configuration, schema migration, and security notes.
 
 `health` · `get_balance` · `create_topup_link` · `create_upgrade_link` ·
 `mint_subagent` · `list_subagents` · `revoke_subagent` · `get_attestation` ·
-`list_services` · `service_quote` · `spend` · `pay_service` · `chat` · `get_receipt` ·
+`list_services` · `service_quote` · `spend` · `pay_service` · `chat` · `extract` · `get_receipt` ·
 `list_transactions` · `list_bounties` · `get_bounty` · `claim_bounty` ·
 `submit_work` · `my_bounties` · `post_bounty` · `settle_bounty` · `my_escrows`
 
 Public tools need no auth. Wallet tools take the agent key as
 `Authorization: Bearer agp_…` on the MCP connection or as the `key` parameter.
-`spend`, `pay_service`, and `chat` accept `approvalId`; when an agent's policy threshold
+`spend`, `pay_service`, `chat`, and `extract` accept `approvalId`; when an agent's policy threshold
 is crossed they return 402 `approval_required` with an approval URL, and the
 retry settles once a human approves.
 
@@ -320,7 +340,7 @@ Cursor / any MCP client:
 - Every spend = ledger event + receipt; every top-up = ledger event; failed x402 = one refund keyed by receipt id.
 - x402 payloads carry the full v2 envelope; signed txs attach their parent tx; the seller broadcasts via ARC (agentpay never broadcasts).
 - x402 buys only confirmed UTXOs, never reuses a txid (random OP_RETURN nonce), and refunds exactly once per charge (refund keyed by receipt id, replay guard on settled txids).
-- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `pay_service`, and `chat`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
+- Agent policies are enforced server-side: tool allowlists and approval thresholds apply to `spend`, `pay_service`, `chat`, and `extract`. Approvals are consumed exactly once and only at settlement, so a funding failure never burns a human approval.
 
 ## Treasury operations
 

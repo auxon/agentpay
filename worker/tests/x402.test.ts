@@ -167,9 +167,9 @@ describe("charging and caps", () => {
   });
 
   it("caps per-call payments", () => {
-    expect(maxPaymentSats(E())).toBe(10_000);
+    expect(maxPaymentSats(E())).toBe(50_000);
     expect(maxPaymentSats(E({ X402_MAX_SATS: "42" }))).toBe(42);
-    expect(maxPaymentSats(E({ X402_MAX_SATS: "nope" }))).toBe(10_000);
+    expect(maxPaymentSats(E({ X402_MAX_SATS: "nope" }))).toBe(50_000);
   });
 });
 

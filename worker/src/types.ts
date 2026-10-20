@@ -83,6 +83,11 @@ export interface AppEnv {
    * Production uses the binding; this is for local/tests (e.g. workers.dev).
    */
   FUSE_CHAT_URL?: string;
+  /**
+   * Fetch fallback for Fuse extract when the FUSE binding is absent.
+   * When unset, derived from FUSE_CHAT_URL (`…/chat/completions` → `…/extract`).
+   */
+  FUSE_EXTRACT_URL?: string;
   /** Operator lifetime trial budget in cents (default 1000 = $10). */
   TRIAL_TOTAL_CAP_CENTS?: string;
   /** Monthly Pro price in USD cents (default 2900). */

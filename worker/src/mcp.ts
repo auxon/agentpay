@@ -15,7 +15,7 @@ import type { AppEnv } from "./types";
 import { TOPUP_MAX_CENTS, TOPUP_MIN_CENTS } from "./stripe";
 
 export const MCP_NAME = "agentpay";
-export const MCP_VERSION = "0.2.0";
+export const MCP_VERSION = "0.3.0";
 
 export const MCP_TOOLS = [
   "health",
@@ -33,6 +33,7 @@ export const MCP_TOOLS = [
   "spend",
   "pay_service",
   "chat",
+  "extract",
   "get_receipt",
   "list_transactions",
   "list_bounties",
@@ -46,7 +47,7 @@ export const MCP_TOOLS = [
 ] as const;
 
 export const MCP_INSTRUCTIONS = [
-  "agentpay is a prepaid USD wallet for AI agents on Cloudflare. Pay-per-call LLM with no API key (chat → Fuse), plus x402/BSV payments for registry APIs.",
+  "agentpay is a prepaid USD wallet for AI agents on Cloudflare. Pay-per-call LLM (chat → Fuse) and typed extract (extract → Fuse) with no API key, plus x402/BSV payments for registry APIs.",
   "Human dashboard: https://entangleit.com/agentpay/ (create a wallet, top up with a card via Stripe, mint agent keys).",
   "Agents authenticate with a scoped key (agp_…). Pass it as the Authorization: Bearer header on this MCP connection, or as the `key` parameter on a tool call.",
   "New agents call onboard first: it inspects balance, claims, and history, then returns the single next action.",
@@ -54,9 +55,10 @@ export const MCP_INSTRUCTIONS = [
   "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges. claim_trial mints a pre-funded trial wallet + key with no human needed (operator-gated, one per IP per day).",
   "Wallet tools: get_balance, list_transactions, get_receipt.",
   "LLM: chat {model, messages} calls Fuse chat completions (https://entangleit.com/fuse/v1/chat/completions). No Fuse API key — agentpay pays the standard x402 v2 402 in sats and returns the completion plus receiptUrl and txid. Models: fuse-fast (500 sats) and fuse-smart (2500 sats). Wallet limits, scoped keys, and trial budgets apply.",
+  "Extract: extract {state, fields} pays Fuse extract (https://entangleit.com/fuse/v1/extract) for typed values from messy text or receipts. Use extract instead of chat when you need structured fields with confidence scores and explicit nulls (p_null) rather than made-up answers. fields is a name→{type} object. Field types: text|number|date|time|datetime|duration|list|estimate|forecast (lists need items, e.g. \"text\"). Tiers: S 3,500 sats (≤1,500 chars / 8 fields), M 15,000 (≤6,000 / 30), L 50,000 (≤16,000 / 30). Images must be base64 PNG/JPEG/WebP (or data URI) and are at least M. Oversized → 413, bad schema → 400. Returns answers, receipt, and txid. dryRun quotes the tier and price without paying.",
   "Spending: spend debits the wallet and writes a receipt. pay_service quotes a registry seller, settles the BSV x402 challenge (legacy single-object or standard v2 accepts[]) from the site wallet, and returns the seller's result — all in one call.",
   "pay_service takes params (tool arguments) and optional amountCents. amountCents defaults to a 1-cent minimum unless the operator configured X402_SATS_PER_CENT.",
-  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry; chat needs \"chat\", \"fuse:*\", or fuse:<model>. approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
+  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry; chat needs \"chat\", \"fuse:*\", or fuse:<model>; extract needs \"extract\", \"fuse:extract\", \"fuse:fuse-extract\", or \"fuse:*\". approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
   "Plans: wallets start on Free (3 agent keys, daily limits up to $50/agent). Pro ($29/mo) raises that to 25 keys, $1,000/agent daily limits, and CSV export. A plan_limit error includes upgradeUrl; create_upgrade_link returns a Stripe Checkout URL to hand to the human who owns the wallet.",
   "Delegation: a top-level agent can mint_subagent for each worker with its own lifetime budget, expiry, daily limit, and allowlist — then list_subagents and revoke_subagent. Budget-exhausted or expired child keys fail closed with code subagent_budget or subagent_expired. Cascading budgets: every child spend also counts against the parent's daily limit (code parent_daily_limit when the parent cap would be exceeded), so a parent cannot dodge its cap by delegating.",
   "Reputation: get_attestation returns an agentpay-signed summary of the wallet's settled activity. Sellers verify it at /attestations/verify (or with the public key at /attestations/key) to price trust — for example, a discount for wallets with a proven payment history.",
@@ -270,7 +272,7 @@ export function createAgentPayMcpServer(
     {
       title: "Pay a service",
       description:
-        "One call for paid registry tools: quotes the seller's x402 challenge (legacy single-object or standard v2 accepts[] — BSV exact only), pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded. For pay-per-call LLM with no API key, use chat instead. Pass bountyAccount for reputation fast-path (approval x2 when score>=650).",
+        "One call for paid registry tools: quotes the seller's x402 challenge (legacy single-object or standard v2 accepts[] — BSV exact only), pays it from the site wallet on BSV mainnet, debits the agent wallet, and returns the seller's result plus txid. If the seller rejects the payment, the debit is refunded. For pay-per-call LLM with no API key, use chat; for typed values from messy text or receipts, use extract. Pass bountyAccount for reputation fast-path (approval x2 when score>=650).",
       inputSchema: z.object({
         serviceId: z.string().describe("Registry service id (from list_services)"),
         tool: z.string().describe("Tool name on that service"),
@@ -333,6 +335,101 @@ export function createAgentPayMcpServer(
     },
   );
 
+  const extractFieldType = z.enum([
+    "text",
+    "number",
+    "date",
+    "time",
+    "datetime",
+    "duration",
+    "list",
+    "estimate",
+    "forecast",
+  ]);
+
+  server.registerTool(
+    "extract",
+    {
+      title: "Extract typed fields",
+      description:
+        "Extract typed values from messy text or receipts. Pays Fuse extract; agentpay settles the standard x402 v2 BSV 402 from this wallet. Prefer this over chat when you need structured fields with confidence scores and explicit nulls (p_null) instead of made-up answers. Types: text|number|date|time|datetime|duration|list|estimate|forecast (lists need items, e.g. \"text\"). fields is a name→{type} object. Tiers: S 3,500 sats (≤1,500 chars, ≤8 fields), M 15,000 (≤6,000 chars, ≤30 fields), L 50,000 (≤16,000 chars, ≤30 fields); images (base64 PNG/JPEG/WebP) are at least M. Oversized → 413, bad schema → 400. Returns answers, receipt, and txid. Pass dryRun to quote the tier and price without spending.",
+      inputSchema: z.object({
+        state: z
+          .string()
+          .optional()
+          .describe("Messy text, receipt, email, or notes. Required unless images are sent."),
+        fields: z
+          .union([
+            z.record(
+              z.string(),
+              z.object({
+                type: extractFieldType,
+                description: z.string().optional(),
+                items: z
+                  .union([
+                    extractFieldType,
+                    z.object({ type: extractFieldType, description: z.string().optional() }),
+                  ])
+                  .optional()
+                  .describe("Required when type is list, e.g. \"text\""),
+              }),
+            ),
+            z
+              .array(
+                z.object({
+                  name: z.string().min(1),
+                  type: extractFieldType,
+                  description: z.string().optional(),
+                  items: z
+                    .union([
+                      extractFieldType,
+                      z.object({ type: extractFieldType, description: z.string().optional() }),
+                    ])
+                    .optional(),
+                }),
+              )
+              .min(1),
+          ])
+          .describe(
+            "Fuse wire format: object mapping field names to {type, items?}. An array of {name, type} is also accepted.",
+          ),
+        reference_date: z
+          .string()
+          .optional()
+          .describe("YYYY-MM-DD (or ISO datetime) used to resolve relative dates like 'yesterday'"),
+        images: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Base64 PNG, JPEG, or WebP (or data URI). Remote URLs are rejected. Image requests are at least M."),
+        amountCents: z.number().int().min(1).optional().describe("Override the USD cents charged (min 1 cent default)"),
+        description: z.string().max(200).optional(),
+        ref: z.string().optional(),
+        approvalId: z.string().optional().describe("Approval id from a prior approval_required response"),
+        dryRun: z.boolean().optional().describe("Quote the extract tier (S/M/L) and price only, no debit or settlement"),
+        key: keyField,
+      }),
+    },
+    async ({
+      state,
+      fields,
+      reference_date,
+      images,
+      amountCents,
+      description,
+      ref,
+      approvalId,
+      dryRun,
+      key,
+    }) => {
+      const { status, json } = await call("POST", "/agent/extract", {
+        key,
+        body: { state, fields, reference_date, images, amountCents, description, ref, approvalId, dryRun },
+      });
+      if (status >= 400) return fail(status, json);
+      return ok(json);
+    },
+  );
+
   server.registerTool(
     "mint_subagent",
     {
@@ -347,7 +444,7 @@ export function createAgentPayMcpServer(
         allowedTools: z
           .array(z.string())
           .optional()
-          .describe("Allowlist entries like serviceId:tool, serviceId:*, chat, or fuse:fuse-fast"),
+          .describe("Allowlist entries like serviceId:tool, serviceId:*, chat, extract, or fuse:fuse-fast"),
         approvalAboveCents: z.number().int().min(1).optional().describe("Human approval threshold in cents"),
         key: keyField,
       }),
