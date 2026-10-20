@@ -196,9 +196,11 @@ CREATE TABLE IF NOT EXISTS ap_subagent_budgets (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_subagent_parent ON ap_subagent_budgets(parent_agent_id);
 
--- Direct agent-initiated BSV sends (POST /agent/send). The idempotency_key is
--- scoped per wallet: a retry with the same key returns the original txid
--- instead of broadcasting a second transaction.
+-- Direct agent-initiated sends (POST /agent/send). dest is a BSV P2PKH address
+-- (settlement=live, txid is on-chain) or an agentpay wallet id apw_…
+-- (settlement=internal, txid is the send/receipt id). The idempotency_key is
+-- scoped per wallet: a retry with the same key returns the original receipt
+-- instead of sending twice.
 CREATE TABLE IF NOT EXISTS ap_sends (
   id TEXT PRIMARY KEY,
   wallet_id TEXT NOT NULL REFERENCES ap_wallets(id) ON DELETE CASCADE,
@@ -210,6 +212,8 @@ CREATE TABLE IF NOT EXISTS ap_sends (
   txid TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   charged_cents INTEGER NOT NULL DEFAULT 0,
+  settlement TEXT NOT NULL DEFAULT 'live' CHECK (settlement IN ('live', 'internal')),
+  dest_wallet_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT
 );

@@ -3,6 +3,7 @@ import { makeTestDb } from "./helpers";
 import {
   agentChatAllowed,
   agentExtractAllowed,
+  agentSendAllowed,
   agentSpendAllowed,
   agentToolAllowed,
   claimX402Txid,
@@ -90,6 +91,11 @@ describe("agent policies", () => {
     expect(agentSpendAllowed([])).toBe(true);
     expect(agentSpendAllowed(["s:t"])).toBe(false);
     expect(agentSpendAllowed(["spend"])).toBe(true);
+    expect(agentSendAllowed([])).toBe(true);
+    expect(agentSendAllowed(["*"])).toBe(true);
+    expect(agentSendAllowed(["spend"])).toBe(true);
+    expect(agentSendAllowed(["agent_send"])).toBe(true);
+    expect(agentSendAllowed(["s:t"])).toBe(false);
     expect(agentChatAllowed([], "fuse-fast")).toBe(true);
     expect(agentChatAllowed(["*"], "fuse-fast")).toBe(true);
     expect(agentChatAllowed(["chat"], "fuse-fast")).toBe(true);

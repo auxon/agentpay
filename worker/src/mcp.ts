@@ -15,7 +15,7 @@ import type { AppEnv } from "./types";
 import { TOPUP_MAX_CENTS, TOPUP_MIN_CENTS } from "./stripe";
 
 export const MCP_NAME = "agentpay";
-export const MCP_VERSION = "0.3.0";
+export const MCP_VERSION = "0.3.1";
 
 export const MCP_TOOLS = [
   "health",
@@ -31,6 +31,7 @@ export const MCP_TOOLS = [
   "list_services",
   "service_quote",
   "spend",
+  "send",
   "pay_service",
   "chat",
   "extract",
@@ -53,12 +54,12 @@ export const MCP_INSTRUCTIONS = [
   "New agents call onboard first: it inspects balance, claims, and history, then returns the single next action.",
   "No key yet: claim_trial mints a pre-funded trial wallet + key (one per IP per day, sized for ~50 fuse-fast calls). Full playbook: https://entangleit.com/api/agentpay/skill · llms.txt: https://entangleit.com/api/agentpay/llms.txt.",
   "Public tools: list_services and service_quote read the x402market registry (paid x402/BSV APIs) and live 402 challenges. claim_trial mints a pre-funded trial wallet + key with no human needed (operator-gated, one per IP per day).",
-  "Wallet tools: get_balance, list_transactions, get_receipt.",
+  "Wallet tools: get_balance, list_transactions, get_receipt, send.",
   "LLM: chat {model, messages} calls Fuse chat completions (https://entangleit.com/fuse/v1/chat/completions). No Fuse API key — agentpay pays the standard x402 v2 402 in sats and returns the completion plus receiptUrl and txid. Models: fuse-fast (500 sats) and fuse-smart (2500 sats). Wallet limits, scoped keys, and trial budgets apply.",
   "Extract: extract {state, fields} pays Fuse extract (https://entangleit.com/fuse/v1/extract) for typed values from messy text or receipts. Use extract instead of chat when you need structured fields with confidence scores and explicit nulls (p_null) rather than made-up answers. fields is a name→{type} object. Field types: text|number|date|time|datetime|duration|list|estimate|forecast (lists need items, e.g. \"text\"). Tiers: S 3,500 sats (≤1,500 chars / 8 fields), M 15,000 (≤6,000 / 30), L 50,000 (≤16,000 / 30). Images must be base64 PNG/JPEG/WebP (or data URI) and are at least M. Oversized → 413, bad schema → 400. Returns answers, receipt, and txid. dryRun quotes the tier and price without paying.",
-  "Spending: spend debits the wallet and writes a receipt. pay_service quotes a registry seller, settles the BSV x402 challenge (legacy single-object or standard v2 accepts[]) from the site wallet, and returns the seller's result — all in one call.",
+  "Spending: spend debits the wallet and writes a receipt. send pays a BSV P2PKH address on-chain (settlement=live, txid is a BSV tx) or an agentpay wallet id apw_… as an internal ledger transfer (settlement=internal, txid is a receipt id). pay_service quotes a registry seller, settles the BSV x402 challenge (legacy single-object or standard v2 accepts[]) from the site wallet, and returns the seller's result — all in one call.",
   "pay_service takes params (tool arguments) and optional amountCents. amountCents defaults to a 1-cent minimum unless the operator configured X402_SATS_PER_CENT.",
-  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry; chat needs \"chat\", \"fuse:*\", or fuse:<model>; extract needs \"extract\", \"fuse:extract\", \"fuse:fuse-extract\", or \"fuse:*\". approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
+  "Per-agent policy: allowedTools restricts pay_service to entries like serviceId:tool or serviceId:* (empty = all); generic spend needs the \"spend\" entry; send needs \"spend\", \"agent_send\", or \"*\"; chat needs \"chat\", \"fuse:*\", or fuse:<model>; extract needs \"extract\", \"fuse:extract\", \"fuse:fuse-extract\", or \"fuse:*\". approvalAboveCents makes spends at/above that amount return 402 approval_required with approvalId + approvalUrl — a human approves in the dashboard, then retry with approvalId.",
   "Plans: wallets start on Free (3 agent keys, daily limits up to $50/agent). Pro ($29/mo) raises that to 25 keys, $1,000/agent daily limits, and CSV export. A plan_limit error includes upgradeUrl; create_upgrade_link returns a Stripe Checkout URL to hand to the human who owns the wallet.",
   "Delegation: a top-level agent can mint_subagent for each worker with its own lifetime budget, expiry, daily limit, and allowlist — then list_subagents and revoke_subagent. Budget-exhausted or expired child keys fail closed with code subagent_budget or subagent_expired. Cascading budgets: every child spend also counts against the parent's daily limit (code parent_daily_limit when the parent cap would be exceeded), so a parent cannot dodge its cap by delegating.",
   "Reputation: get_attestation returns an agentpay-signed summary of the wallet's settled activity. Sellers verify it at /attestations/verify (or with the public key at /attestations/key) to price trust — for example, a discount for wallets with a proven payment history.",
@@ -261,6 +262,37 @@ export function createAgentPayMcpServer(
       const { status, json } = await call("POST", "/agent/spend", {
         key,
         body: { amountCents, description, service, tool, ref, approvalId },
+      });
+      if (status >= 400) return fail(status, json);
+      return ok(json);
+    },
+  );
+
+  server.registerTool(
+    "send",
+    {
+      title: "Send to an address or wallet",
+      description:
+        "Pay sats to a BSV P2PKH address (on-chain, settlement=live, txid is a BSV transaction) or to an agentpay wallet id apw_… (internal ledger credit, settlement=internal, txid is a receipt id). Idempotent per idempotency_key. Daily limits, allowlists (spend or agent_send), and approval thresholds apply. Pass the public wallet id, never the secret apw_ token.",
+      inputSchema: z.object({
+        dest: z
+          .string()
+          .describe("BSV P2PKH address (1… / 3…) or public agentpay wallet id (apw_…, not the secret token)"),
+        sats: z.number().int().positive().describe("Amount in satoshis"),
+        memo: z.string().max(200).optional().describe("Optional note stored on the send"),
+        idempotency_key: z
+          .string()
+          .max(120)
+          .optional()
+          .describe("Replay key: a retry with the same key returns the original txid/receipt instead of sending twice"),
+        approvalId: z.string().optional().describe("Approval id from a prior approval_required response"),
+        key: keyField,
+      }),
+    },
+    async ({ dest, sats, memo, idempotency_key, approvalId, key }) => {
+      const { status, json } = await call("POST", "/agent/send", {
+        key,
+        body: { dest, sats, memo, idempotency_key, approvalId },
       });
       if (status >= 400) return fail(status, json);
       return ok(json);

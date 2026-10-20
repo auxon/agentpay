@@ -3,6 +3,7 @@ import { makeTestDb } from "./helpers";
 import {
   createAgent,
   createWallet,
+  creditInternalTransfer,
   creditTopup,
   getBalanceCents,
   getReceipt,
@@ -160,6 +161,60 @@ describe("agent daily limits", () => {
     const next = await spend(db, { walletId: wallet.id, agent, amountCents: 300, description: "today" });
     expect(next.agentSpentTodayCents).toBe(300);
     expect(next.balanceCents).toBe(400);
+  });
+
+  it("credits an internal transfer without bumping lifetime top-up", async () => {
+    const { db, wallet } = await makeWallet();
+    const { wallet: dest } = await createWallet(db, { name: "Dest" });
+    const res = await creditInternalTransfer(db, {
+      destWalletId: dest.id,
+      amountCents: 250,
+      ref: "send:snd_test1",
+      fromWalletId: wallet.id,
+      sendId: "snd_test1",
+      sats: 10_000,
+      memo: "bounty",
+    });
+    expect(res.credited).toBe(true);
+    expect(res.balanceCents).toBe(250);
+    expect(await getBalanceCents(db, dest.id)).toBe(250);
+    const destRow = await db
+      .prepare("SELECT lifetime_topup_cents FROM ap_wallets WHERE id = ?")
+      .bind(dest.id)
+      .first<{ lifetime_topup_cents: number }>();
+    expect(destRow?.lifetime_topup_cents).toBe(0);
+    const events = await listLedger(db, dest.id);
+    expect(events).toHaveLength(1);
+    expect(events[0].kind).toBe("adjust");
+    expect(JSON.parse(events[0].meta_json).type).toBe("internal_transfer");
+  });
+
+  it("is idempotent by send ref and rejects unknown or frozen dest wallets", async () => {
+    const { db, wallet } = await makeWallet();
+    const { wallet: dest } = await createWallet(db, { name: "Dest" });
+    const input = {
+      destWalletId: dest.id,
+      amountCents: 100,
+      ref: "send:snd_dupe",
+      fromWalletId: wallet.id,
+      sendId: "snd_dupe",
+      sats: 4000,
+    };
+    await creditInternalTransfer(db, input);
+    const second = await creditInternalTransfer(db, input);
+    expect(second.credited).toBe(false);
+    expect(await getBalanceCents(db, dest.id)).toBe(100);
+    await expectHttpError(
+      creditInternalTransfer(db, { ...input, destWalletId: "apw_doesnotexistxx", ref: "send:snd_missing" }),
+      404,
+      /Unknown destination wallet/,
+    );
+    await db.prepare("UPDATE ap_wallets SET status = 'frozen' WHERE id = ?").bind(dest.id).run();
+    await expectHttpError(
+      creditInternalTransfer(db, { ...input, ref: "send:snd_frozen" }),
+      403,
+      /frozen/,
+    );
   });
 
   it("rejects spending from a revoked agent's key at the auth layer (see auth.test)", async () => {

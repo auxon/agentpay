@@ -416,9 +416,40 @@ export function bountyPayoutInfo(env: AppEnv): { address: string | null; note: s
 // ---------- agentpay-funded bounties (on-chain sats escrow) ----------
 
 const P2PKH_ADDRESS = /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/;
+/** Public wallet id from newId("apw") — not the 64-hex secret token. */
+const WALLET_ID = /^apw_[0-9A-Za-z]{8,48}$/;
+const WALLET_TOKEN_SHAPE = /^apw_[0-9a-fA-F]{64}$/;
 
 export function isValidBsvAddress(value: unknown): value is string {
   return typeof value === "string" && P2PKH_ADDRESS.test(value.trim());
+}
+
+export function isWalletTokenShape(value: unknown): value is string {
+  return typeof value === "string" && WALLET_TOKEN_SHAPE.test(value.trim());
+}
+
+export function isAgentpayWalletId(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const dest = value.trim();
+  if (WALLET_TOKEN_SHAPE.test(dest)) return false;
+  return WALLET_ID.test(dest);
+}
+
+export type SendDest = { kind: "p2pkh"; dest: string } | { kind: "wallet"; dest: string };
+
+/** P2PKH address or public agentpay wallet id (apw_…). Rejects secret tokens. */
+export function parseSendDest(value: unknown): SendDest {
+  const dest = typeof value === "string" ? value.trim() : "";
+  if (!dest) throw new HttpError(400, "dest is required");
+  if (isWalletTokenShape(dest)) {
+    throw new HttpError(
+      400,
+      "dest looks like a wallet token; pass the public wallet id (apw_…), not the secret token",
+    );
+  }
+  if (isAgentpayWalletId(dest)) return { kind: "wallet", dest };
+  if (isValidBsvAddress(dest)) return { kind: "p2pkh", dest };
+  throw new HttpError(400, "dest must be a BSV P2PKH address or an agentpay wallet id (apw_…)");
 }
 
 /** Charges round up so treasury sats never sell below the posted rate. */
